@@ -78,7 +78,7 @@ benchctl/
     idf.py                 # ESP-IDF line parsing, reset/sha detection       [U2]
     redact.py              # Redactor built from profile patterns           [U2]
     profile.py             # Profile TOML load/validate/lookup              [U3]
-    registry.py            # units.toml load + port matching                [U3]
+    registry.py            # units.toml load + port listing and matching    [U3]
     scenario.py            # Scenario TOML load/validate (schema only)      [U3]
     artifacts.py           # flasher_args.json / build dir / addr=file, app desc, sha  [U3]
     transport.py           # Transport Protocol + PySerialTransport + ModemLines  [U4]
@@ -147,6 +147,9 @@ Import dependencies (not the same as file ownership) fix the build order in Sect
 
 `<attach-ts>` and `<ts>` are `YYYYmmddTHHMMSS` local time.
 
+Unit names are path components: `[A-Za-z0-9][A-Za-z0-9_.-]*`, and `runs` is reserved
+(`paths.check_unit_name`, raises `usage`). The registry loader applies the same check.
+
 ### 3.2 Roles
 
 - **Client** (`benchctl <verb>`): resolves the unit, connects to the socket, sends one
@@ -170,7 +173,8 @@ Import dependencies (not the same as file ownership) fix the build order in Sect
    spawn the daemon: `Popen([sys.executable, "-m", "benchctl", "daemon", "--unit", U],
    start_new_session=True, stdin=DEVNULL, stdout=stderr=<state>/<unit>/daemon.log)`.
    `BENCHCTL_DAEMON_ARGV` (space-separated) replaces the argv; it is the test seam that
-   lets the CLI tests spawn `tests/fake_daemon.py`.
+   lets the CLI tests spawn `tests/fake_daemon.py`. The spawned daemon inherits the
+   environment, so `BENCHCTL_PORTS_FILE` (Section 7.4) reaches it too.
 3. Poll for the socket every 100 ms up to `attach_timeout` (default 15 s). Then `hello`.
 4. The daemon takes the port lock first (`lease.lock`, `flock(LOCK_EX|LOCK_NB)`). Two
    clients racing to spawn: the loser's daemon exits 3 within a second; the loser client's
@@ -214,7 +218,7 @@ Dataclasses (all `frozen=True, slots=True`, JSON-serialisable via `dataclasses.a
 Offset = int                      # line index in the daemon log since attach, 0-based
 ModemLines = Callable[[bool], None]   # reset strategy: argument True = enter bootloader; default pulses RTS/DTR via esptool.reset
 class Cursor: ...                 # parse "boot"|"attach"|"<int>"|"<mark name>" → resolved by Session
-@dataclass class LogLine: offset: Offset; t: float; ts: str; text: str; meta: bool
+@dataclass class LogLine: offset: Offset; t: float; ts: str; text: str; meta: bool   # ts = HH:MM:SS.mmm local, the first token of a serial.log line; t = seconds since attach
 @dataclass class ResetInfo: offset: Offset; t: float; code: int|None; reason: str; boot_mode: str|None;
                             elf_sha: str|None; expected: bool; cause: str|None; context: list[str]
 @dataclass class Identity: fields: dict[str, str]; verified: bool; mismatches: dict[str, tuple[str, str]]
@@ -240,7 +244,8 @@ class Transport(Protocol):                         # implemented by U4; used by 
     def read(self, max_bytes: int, timeout: float) -> bytes: ...   # b"" on timeout; raises TransportLost
     def write(self, data: bytes) -> None: ...
     def reset(self, bootloader: bool = False) -> None: ...
-    def get_settings(self) -> dict: ...; def apply_settings(self, s: dict) -> None: ...
+    def get_settings(self) -> dict: ...
+    def apply_settings(self, s: dict) -> None: ...  # restores the saved settings AND discards pending input; callers do nothing more
     def set_baud(self, baud: int) -> None: ...
     def close(self) -> None: ...
     @property def raw(self) -> serial.Serial: ...  # for esptool only
@@ -249,17 +254,21 @@ class Session(Protocol):                           # implemented by U4; used by 
     profile: Profile; unit: str; session_dir: Path
     def status(self) -> Status: ...
     def mark(self, name: str | None) -> Offset: ...
+    def note(self, text: str) -> Offset: ...        # appends the meta line `## <text>` (redacted, occupies an offset); flash begin/end use it
     def resolve(self, cursor: str) -> Offset: ...
     def cmd(self, line: str, *, expect: str|None, error: list[str], capture: bool|None,
             timeout: float, reboots: bool, secret: bool, force: bool, source: str) -> CmdResult: ...
     def wait(self, pattern: str|None, since: Offset, timeout: float, *, absent: str|None,
              window: float|None, order: list[str]|None, progress: Callable[[dict], None]|None) -> WaitResult: ...
     def log(self, since: Offset, until: Offset|None, grep: str|None, limit: int) -> list[LogLine]: ...
-    def reset(self, bootloader: bool, wait_rst: float = 5.0) -> ResetInfo | None: ...
+    def reset(self, bootloader: bool, wait_rst: float = 5.0, *, cause: str = "reset") -> ResetInfo | None: ...
+                                                   # cause is the arming record's cause (Section 4.5); flash passes "flash"
+    def set_gate(self, state: Literal["booting", "bootloader"], method: str | None = None) -> None: ...
+                                                   # the only gate write from outside gate.py; flash --after no-reset → "bootloader"
     def arm_reset(self, cause: str, window: float) -> None: ...
     def identity(self, reprobe: bool = False) -> Identity: ...
-    def gate_check(self, since: Offset, timeout: float) -> dict: ...   # env gate (Section 5.7)
-    def subscribe(self) -> Subscription: ...       # bounded queue of LogLine + Event dicts
+    def gate_check(self, since: Offset, timeout: float) -> dict: ...   # env gate (Section 5)
+    def subscribe(self) -> Subscription: ...       # see below
     def device_lock(self) -> ContextManager[None]: ...
     def pause_reader(self) -> ContextManager[Transport]: ...  # parks the reader; yields the transport
     def emit(self, event: dict) -> None: ...       # append to session events.jsonl + subscribers
@@ -269,12 +278,31 @@ class DeviceClient(Protocol):                      # implemented by U5 Client; u
     # one method per socket op in Section 7.2, same names and arguments; raises BenchctlError(code)
 ```
 
+- `emit` stamps the common fields of Section 7.5 (`seq, ts, t, unit, fw, dev`, and `offset:
+  null` when absent). Callers pass `type`, the per-type fields, and `offset` when the record
+  refers to one.
+- `Subscription` is a concrete class in `types.py`: a bounded queue (`maxsize=10_000`) of
+  `LogLine | Event`. `offer(item) -> bool` never blocks; a full queue ends the feed and the
+  consumer's next `get(timeout)` raises `BenchctlError(code="slow_client")`. `get` returns
+  `None` on timeout; `close()` unsubscribes. Producers drop a feed whose `offer` returned
+  False.
+- `DeviceClient` return shapes, where the op result is not a single 4.1 dataclass: `hello`,
+  `gate`, `lease` return `dict`; `mark` returns `Offset`; `log` returns `(lines, next)`;
+  `reset` returns `(offset, reset)`; `capture` returns `(lines, reset)`; `tail` returns a
+  `Subscription`; `detach` returns `None`. `since`/`until` accept `Offset | str` (a cursor in
+  the 7.1 grammar); `Session` takes `Offset` only, so the daemon resolves strings (7.2).
+  `flash` takes `files, *, after, baud, flash_args`; `chip` and `before` come from the
+  daemon's profile.
+
 `scenario.py` (U3) owns `Scenario` and `Step` dataclasses; the runner (U7) imports them.
 
-`errors.py`: `class BenchctlError(Exception): code: str` with subclasses `UsageError("usage")`,
-`BusyError("busy")`, `DeviceError("device")`, `TimeoutError_("timeout")`,
-`AssertionFailed("assert")`, `InternalError("internal")`, `TransportLost`. `exit_code(code)`
-maps per Section 7.1.
+`errors.py`: `class BenchctlError(Exception)` constructed as `BenchctlError(message, *,
+code=None, data=None)`; `code` defaults to the subclass's class attribute, and the keyword
+exists for the wire-only codes `slow_client`/`protocol` that have no subclass. Subclasses
+`UsageError("usage")`, `BusyError("busy")`, `DeviceError("device")`,
+`TimeoutError_("timeout")`, `AssertionFailed("assert")`, `InternalError("internal")`, and
+`TransportLost(DeviceError)`. `to_dict()`/`from_dict()` are the 7.1 error JSON;
+`exit_code(code)` maps per Section 7.1, unknown codes → 4.
 
 ### 4.2 Threads inside the daemon
 
@@ -392,9 +420,9 @@ booting for > boot.ready_timeout, or unknown  → probe: send boot.probe + line_
   attach with three decimals. First line: `## attach unit=<u> port=<p> baud=<b> at=<iso>`.
 - Meta lines are benchctl's own and start with `## `: `## tx <line>` (what was sent,
   redacted; `## tx <redacted>` when `secret`), `## reset requested bootloader=<bool>`,
-  `## flash begin|end …`, `## mark <name>`, `## probe`, `## port lost|back …`. They occupy
-  offsets so `cmd` can return its `tx` offset and a `wait --since <that>` cannot miss the
-  reply.
+  `## flash begin|end …` (written by U6 through `Session.note`), `## mark <name>`,
+  `## probe`, `## port lost|back …`. They occupy offsets so `cmd` can return its `tx` offset
+  and a `wait --since <that>` cannot miss the reply.
 
 ### 4.8 Redaction (`redact.py`)
 
@@ -422,10 +450,11 @@ booting for > boot.ready_timeout, or unknown  → probe: send boot.probe + line_
 - Loss: pyserial raises `SerialException` ("device reports readiness to read but returned
   no data") or `OSError` when the device vanishes; the transport converts both to
   `TransportLost`. The reader then: emits `port_lost`, closes, and loops every 0.5 s
-  (esp-idf-monitor's cadence): re-resolve the port through the registry match (the path
-  may change on native USB), open with lines low, emit `port_back {path, gap}`, set gate
-  `unknown`. After `reconnect_timeout` (default 120 s) it keeps trying every 5 s; `status`
-  shows `connected: false`. Waits are bounded by their own timeouts regardless.
+  (esp-idf-monitor's cadence): re-resolve the port through `registry.list_ports()` +
+  `match_port` (the path may change on native USB; zero candidates while unplugged means
+  keep looping), open with lines low, emit `port_back {path, gap}`, set gate `unknown`.
+  After `reconnect_timeout` (default 120 s) it keeps trying every 5 s; `status` shows
+  `connected: false`. Waits are bounded by their own timeouts regardless.
 
 ### 4.10 Flashing on the held handle (`flash.py`)
 
@@ -446,20 +475,27 @@ parses `AppDesc` from the entry with `name == "app"`.
 
 ```
 1. files = [FlashFile(addr, path, name, sha256(path), size)]; app = appdesc(files["app"]) if present
-2. session.arm_reset("flash", window)                   # the after-reset is expected
-3. with session.pause_reader() as t:
-4.     settings = t.get_settings()
-5.     esp = esptool.targets.CHIP_DEFS[profile.flash.chip](t.raw, 115200)
-6.     esp.connect(profile.flash.before)                # "default-reset": DTR/RTS dance into the ROM bootloader
-7.     argv = ["--chip", chip, "--baud", str(flash.baud), "--before", "no-reset", "--after", after,
+   session.note(f"flash begin {' '.join(f.name for f in files)} baud={baud} after={after}")
+2. with session.pause_reader() as t:
+3.     settings = t.get_settings()
+4.     esp = esptool.targets.CHIP_DEFS[profile.flash.chip](t.raw, 115200)
+5.     esp.connect(profile.flash.before)                # "default-reset": DTR/RTS dance into the ROM bootloader
+6.     argv = ["--chip", chip, "--baud", str(flash.baud), "--before", "no-reset", "--after", "no-reset",
                "write-flash", "--flash-mode", m, "--flash-size", s, "--flash-freq", f, *[hex(addr), path, ...]]
-8.     with redirect_stdout(EventLineWriter(session, "flash_log")):   # progress → events, never the tty
-9.         esptool.main(argv, esp=esp)                  # FatalError / SerialException → DeviceError(exit 4)
-10.    finally: t.apply_settings(settings)              # back to console baud; reset_input_buffer()
-11. gate → booting if after == "hard-reset" (then wait ≤5 s for the rst line → FlashResult.reset),
-    gate → bootloader if after == "no-reset"; emit flash event
+7.     with redirect_stdout(EventLineWriter(session, "flash_log")):   # progress → events, never the tty
+8.         esptool.main(argv, esp=esp)                  # FatalError / SerialException → DeviceError(exit 4)
+9.     finally: t.apply_settings(settings)         # console baud back, pending input discarded (chip is parked in the stub: only SLIP leftovers)
+10. reader resumed. session.note(f"flash end status={ok|error} duration={d:.1f}")
+    after == "hard-reset": FlashResult.reset = session.reset(False, wait_rst=5.0, cause="flash")
+    after == "no-reset":  session.set_gate("bootloader", method="flash"); FlashResult.reset = None
+11. emit flash event
 ```
 
+- esptool is always told `--after no-reset` on the held handle. If esptool performed the hard
+  reset itself, the ROM banner would arrive at the flash baud while the reader is parked, and
+  step 9's input flush could swallow the `rst:` line. Resetting through
+  `session.reset` after the reader resumes makes the arming, the gate move, and the
+  `ResetInfo` the ordinary reset path.
 - `flasher_args.json` uses underscore flags (`--flash_mode`); `artifacts.py` normalises to
   esptool 5 hyphen names itself rather than relying on the deprecation shim.
 - `after` is `hard-reset` by default and `no-reset` when `--after no-reset` (for an OTA test's
@@ -468,8 +504,9 @@ parses `AppDesc` from the entry with `name == "app"`.
   segment header) with struct `<II8s32s32s16s16s32s32s` and magic `0xABCD5432`: version,
   project, time, date, idf_ver, `app_elf_sha256` (full 64 hex). Signed images keep the
   header, so this works on the signed artifacts the bench flashes.
-- Direct mode (no daemon): `esptool.main(argv_with("--port", path))`, letting esptool open
-  and close the port. If the daemon holds the port the `exclusive` open fails →
+- Direct mode (no daemon): `esptool.main(argv_with("--port", path, "--after", after))`,
+  letting esptool open, reset and close the port (nobody is reading, so esptool's own
+  after-reset is fine). If the daemon holds the port the `exclusive` open fails →
   `DeviceError("port busy: unit <u> daemon is running")`, exit 4. The client only takes the
   direct path when no socket answered.
 
@@ -477,8 +514,12 @@ parses `AppDesc` from the entry with `name == "app"`.
 
 - Daemon mode: `reset` then `wait`-style collection of lines for `--seconds N` since the
   reset's offset; returns the slice.
-- Direct mode: open transport, `reset()`, read for N seconds, print `+t text` lines with
-  `t` since reset. Output format equals `log`'s text format.
+- Direct mode: open the port, reset through `lines` (default: esptool `HardReset` on the
+  handle), read for N seconds through `linebuf.LineEngine`, return `LogLine`s with `offset`
+  counted from 0 and `t` since the reset call. Output format equals `log`'s text format.
+  `capture_direct` opens `serial.Serial` itself with the Section 4.9 settings and never
+  imports `transport.py`; it is the one second opener in the tree, so U6 depends on U2 but
+  not on U4.
 
 ### 4.12 Identity (`session.identity`)
 
@@ -529,6 +570,7 @@ def sha256_file(path: str) -> tuple[str, int]: ...
 def load_profile(name_or_path: str | None, cwd: Path, config_dir: Path) -> Profile: ...
 def render(template: str, args: dict[str, str]) -> str: ...          # hail's render: missing/unused args are errors
 def load_registry(config_dir: Path) -> Registry: ...
+def list_ports() -> list[ListPortInfo]: ...   # the only comports() caller; BENCHCTL_PORTS_FILE seam (Section 7.4)
 def match_port(spec: dict[str, str], ports: list[ListPortInfo]) -> str: ...   # raises DeviceError naming candidates
 def load_scenario(path: Path) -> Scenario: ...
 def validate_paths(paths: list[Path]) -> list[dict[str, object]]: ... # the `validate` verb's result rows
@@ -576,11 +618,15 @@ def validate_paths(paths: list[Path]) -> list[dict[str, object]]: ... # the `val
 
 - Owns a pty master; `path` is the slave (`os.ttyname`). A thread reads TX bytes, splits on
   the configured line ending (default `\r`), echoes them like a shell, dispatches commands.
-- `reset()`: replays the boot script: a list of `(delay_s, bytes)` with ESP-IDF-shaped
-  lines (`rst:0x1 (POWERON),boot:0x8 (SPI_FAST_FLASH_BOOT)`, ANSI-coloured `I (ms) TAG:`
+- `reset(bootloader=False)`: prints the ROM banner and the `rst:` line itself (`rst:0x1
+  (POWERON)` for `reset()`, `rst:0xc (RTC_SW_CPU_RST)` for a software reboot, `boot:0x0
+  (DOWNLOAD…)` plus `waiting for download` for `bootloader=True`), then replays the boot
+  script: a list of `(delay_s, bytes)` with ESP-IDF-shaped lines (ANSI-coloured `I (ms) TAG:`
   lines with increasing ms, `ELF file SHA256:  <16 hex>`, a line containing `°`), then the
-  prompt `demo> ` **without** a terminator. Writes are deliberately split mid-UTF-8 and
-  between `\r` and `\n` to exercise the line engine. Timings scale by `timescale`.
+  prompt `demo> ` **without** a terminator. A script cannot omit the `rst:` line; the
+  ms-regression inference is tested on `idf.py` alone. Writes are deliberately split
+  mid-UTF-8 and between `\r` and `\n` to exercise the line engine. Timings scale by
+  `timescale`. The device is silent until the first `reset()`.
 - Boot behaviours: commands within `blind_s` after reset are dropped; commands matching
   `reboot_window_cmds` sent inside `[win_start, win_end]` after reset trigger a reboot with
   `rst:0xc (RTC_SW_CPU_RST)`; `reboot` triggers a software reset; `version` answers
@@ -589,11 +635,31 @@ def validate_paths(paths: list[Path]) -> list[dict[str, object]]: ... # the `val
   with the prompt.
 - `vanish()` closes the master (the slave then raises on read, as the real port does);
   `reappear()` opens a new pty pair and returns the **new** path, so reconnect must
-  re-resolve.
-- Fixtures (`conftest.py`): `fakedev`, `state_dir`/`config_dir` (tmp paths exported as
-  `BENCHCTL_STATE_DIR`/`BENCHCTL_CONFIG_DIR`), `registry` (writes `units.toml` with a `device`
-  match on `fakedev.path`), `profile` (loads `examples/profile.toml` overridden with
-  scaled `settle`/`ready_timeout`), `fake_lines` (ModemLines hook bound to `fakedev.reset`).
+  re-resolve. `reappear()` does **not** replay boot (shell up, no `rst:`): that is the
+  `port_back → unknown → probe` path of 4.6. A test that wants the native-USB sequence calls
+  `reappear()` then `reset()`.
+- Each fake carries a stable `serial_number` (`FAKE0001`…) and Espressif USB-Serial/JTAG
+  `vid`/`pid`; `port_info()` returns the `ListPortInfo` `comports()` would. `present` is
+  True while the pty exists; `on_change` (constructor argument) is called after every
+  open/vanish/reappear/close. `received` (`RxRecord(line, outcome, since_reset)`) and
+  `resets` record what happened for assertions.
+- Fixtures (`conftest.py`): `make_fakedev`/`fakedev`; `state_dir` (short path under `/tmp`,
+  AF_UNIX's 104-byte cap) and `config_dir` (`tmp_path`), exported as
+  `BENCHCTL_STATE_DIR`/`BENCHCTL_CONFIG_DIR`, both autouse so no test touches the real
+  trees; `ports_file` (writes the 7.4 ports file for every present fake made through
+  `make_fakedev`, re-written automatically through `on_change`, exported as
+  `BENCHCTL_PORTS_FILE`); `registry` (writes `units.toml` registering `u1` with
+  `match = { serial = <fakedev.serial_number> }`, which survives `reappear()`); `profile`
+  (`install_profile(config_dir)` then U3's `load_profile`); `fake_lines` (ModemLines hook
+  bound to `fakedev.reset`).
+- `install_profile(config_dir, source=examples/profile.toml, timescale)` fits the generic
+  example to the fake and installs it as `<config>/profiles/esp-idf/profile.toml`: forces
+  `profile.name = "esp-idf"`, sets `console.prompt` to the fake's prompt, drops `boot.ready`
+  (so it defaults to the prompt), multiplies `boot.settle`/`ready_timeout`/`probe_interval`
+  by `timescale`, and appends a `sip_pass` redaction when none exists. It writes TOML through
+  `conftest.dump_toml` (floats via `repr`, strings as JSON-escaped basic strings, dicts as
+  tables, lists of dicts as table arrays). U3's example and validator must accept that
+  output.
 
 ### 6.2 Per-unit tests
 
@@ -602,8 +668,8 @@ def validate_paths(paths: list[Path]) -> list[dict[str, object]]: ... # the `val
 | U2 | pure functions | hail's cases ported one-to-one (Section 8, U2), IDF parsing, redaction rules |
 | U3 | TOML strings, synthetic `.bin` with an app-desc struct, a temp build dir with `flasher_args.json` | load/validate/lookup, port matching, argv normalisation, sha/app-desc |
 | U4 | `fakedev` through the real `PySerialTransport` | offsets, gate transitions, reset classification, cmd/wait semantics, vanish/reappear |
-| U5 | `tests/fake_daemon.py` (real `daemon.py` serving a `FakeSession`), spawned via `BENCHCTL_DAEMON_ARGV` | protocol, lease/busy/take, auto-attach race, every verb's `--json` shape and exit code, two state dirs in parallel, SKILL.md covers every verb |
-| U6 | injected fake `esptool.main` + a `FakeTransport`; `fakedev` for direct capture | argv, pause/settings-restore/arming sequence, failure path still resumes the reader, hashes |
+| U5 | `tests/fake_daemon.py` (real `daemon.py` serving a `FakeSession`), spawned via `BENCHCTL_DAEMON_ARGV`; `fake_daemon.py` replaces `flash.flash_on_session`, `capture.capture_on_session` and the CLI test process replaces `runner.run_scenario` with canned results, so U5 needs only the scaffold's stub signatures | protocol, lease/busy/take, auto-attach race, every verb's `--json` shape and exit code, two state dirs in parallel, SKILL.md covers every verb |
+| U6 | injected fake `esptool.main` + a `FakeSession`/`FakeTransport`; `fakedev` for direct capture | argv, pause/settings-restore then `session.reset(cause="flash")` or `set_gate("bootloader")`, failure path still resumes the reader, hashes |
 | U7 | `FakeClient` implementing `DeviceClient` | triggers/`at`, since resolution, undo order on failure and SIGINT, human confirm, run dir contents, results.md, budget |
 
 ### 6.3 Rules
@@ -715,6 +781,10 @@ offset; `cmd` prints the captured text or the matched line; `wait` prints the ma
 
 Owner enforcement per 3.4: `hello` records the connection's owner; mutating ops check it.
 
+`since`/`until` on the wire are an int offset or a cursor string in the 7.1 grammar. The
+daemon resolves strings through `Session.resolve` before dispatch; an unknown mark is
+`usage`.
+
 ### 7.3 Profile TOML **[portable]**
 
 ```toml
@@ -806,6 +876,16 @@ mac = "AA:BB:CC:DD:EE:FF"                            # any identity field name �
 # id_field = "mac"                                   # which field becomes events' `dev`; default mac, then cert_cn
 ```
 
+Port enumeration: `registry.list_ports()` is the only place that calls
+`serial.tools.list_ports.comports()`; `units`, attach, reconnect, and direct mode all take
+their candidates from it. With `BENCHCTL_PORTS_FILE` set it instead reads that file on every
+call (no caching: a reconnect re-resolves after the path changed). The file is a JSON list of
+objects with the keys `device, vid, pid, serial_number, location, manufacturer, product,
+description` (`vid`/`pid` ints or null, the rest strings or null); each becomes a
+`ListPortInfo(device, skip_link_detection=True)` with those attributes set and `hwid =
+usb_info()`. ptys never appear in `comports()`, so this is how a fake device is found; the
+match `vid`/`pid` strings compare against `f"{vid:04x}"` case-insensitively.
+
 ### 7.5 `events.jsonl` **[portable]**
 
 One JSON object per line. Common fields on every record:
@@ -830,7 +910,7 @@ Per-type fields:
 | `identity` | `fields: {…}, verified, mismatches: {field: [expected, got]}` |
 | `reset` | `code, reason, boot_mode, elf_sha, expected, cause, context: [str]` |
 | `elf_sha` | `sha, boot_offset` (when the SHA line follows the reset) |
-| `gate` | `state, method: pattern\|probe\|null` |
+| `gate` | `state, method: pattern\|probe\|flash\|null` |
 | `tx` | `line, source: cmd\|monitor\|probe\|identity\|runner, request_id` |
 | `reply` | `request_id, status, line, groups, captured, duration` |
 | `mark` | `name` |
@@ -946,8 +1026,8 @@ acceptance criterion each. Import dependencies set the order:
 | Wave | Units | Depends on |
 |---|---|---|
 | 0 | U1 scaffold | — |
-| 1 | U2 text, U3 config, U6 flash/capture | U1 (U6 uses only `types.Transport`/`Session`, esptool, and the scaffold stubs) |
-| 2 | U4 session (U2, U3), U5 daemon/CLI (U3, U6; runner via the stub), U7 runner (U3) | wave 1 |
+| 1 | U2 text, U3 config | U1 |
+| 2 | U4 session (U2, U3), U5 daemon/CLI (U3; U6/U7 via the stub signatures, Section 6.2), U6 flash/capture (U2 `linebuf`, U3 `artifacts`, `types.Transport`/`Session`, esptool), U7 runner (U3) | wave 1 |
 | 3 | U8 Device profile | U5 (`validate`), U3 |
 
 Units within a wave run in parallel. A unit's gate must pass with only its wave's
@@ -961,7 +1041,9 @@ mypy config, `src/benchctl/{__init__,__main__,types,errors,paths,durations}.py`,
 Acceptance: `scripts/gates.sh` passes, and `test_scaffold.py` proves the fixture: a
 `FakeDevice` on a pty, opened through pyserial with `exclusive=True`, replays its boot
 script on `reset()`, drops a command sent inside `blind_s`, answers `version` with the
-prompt in the tail, and after `vanish()` the slave read raises `SerialException`.
+prompt in the tail, after `vanish()` the slave read raises `SerialException`, and the
+`ports_file` lists the fake, is empty while it is vanished, and lists the new path after
+`reappear()`.
 
 **U2 text layer** — `linebuf.py`, `idf.py`, `redact.py` + tests.
 Acceptance: hail's tests pass ported one-to-one — `expect_returns_success_and_skips_noise`,
@@ -984,7 +1066,10 @@ hail's config/render cases pass (see U2); `render` rejects missing and unused ar
 `artifacts.resolve` handles build dir, `flasher_args.json`, and `addr=file` input
 (hyphen-normalised flags, `--only` filtering, sha256 per file) and parses `AppDesc` from a
 synthetic image; the registry picks exactly one port from a synthetic `comports()` list and
-reports ambiguity.
+reports ambiguity; `list_ports()` reads `BENCHCTL_PORTS_FILE` when set and the `registry`
+fixture's unit resolves to `fakedev.path` through it. U3 may delete the
+`benchctl.profile`/`benchctl.scenario` mypy override in `pyproject.toml` once those modules
+exist.
 
 **U4 device session** — `transport.py`, `logstore.py`, `gate.py`, `session.py` + tests.
 Acceptance: against `fakedev` through `PySerialTransport`: attach resets once and stores
@@ -1009,14 +1094,17 @@ dirs run two daemons concurrently; identity mismatch leaves the daemon unverifie
 frontmatter (`name`, `description`) and names every CLI verb.
 
 **U6 flash and capture** — `flash.py`, `capture.py` + tests.
-Acceptance: with a fake `esptool.main` and a `FakeTransport`: the argv for a build dir, a
-`flasher_args.json`, and `addr=file` pairs matches 4.10 step 7 exactly (hyphen flags,
-`--before no-reset`, `--after`), `connect(before)` is called before `main`, the reader is
-paused during `main` and resumed after, transport settings are restored on success and on
-`FatalError` (which surfaces as exit 4), `arm_reset("flash")` precedes `main`, the gate is
-set to `booting` for `hard-reset` and `bootloader` for `no-reset`, and the `FlashResult`
-carries per-file sha256 and the `AppDesc` taken from the `app` entry; direct-mode
-`capture --reset` on `fakedev` returns the boot lines with `t` since reset.
+Acceptance: with a fake `esptool.main` and a `FakeSession`/`FakeTransport`: the argv for a
+build dir, a `flasher_args.json`, and `addr=file` pairs matches 4.10 step 6 exactly (hyphen
+flags, `--before no-reset`, `--after no-reset`), `connect(before)` is called before `main`,
+the reader is paused during `main` and resumed after, transport settings are restored on
+success and on `FatalError` (which surfaces as exit 4), `## flash begin` and `## flash end`
+go through `session.note`, after the pause exits
+`session.reset(False, wait_rst=5.0, cause="flash")` is called for `hard-reset` and
+`session.set_gate("bootloader", method="flash")` for `no-reset`, and the `FlashResult`
+carries per-file sha256, the `AppDesc` taken from the `app` entry, and the `ResetInfo` the
+session returned; direct-mode `capture --reset` on `fakedev` returns the boot lines with `t`
+since reset.
 
 **U7 runner, events, report** — `runner.py`, `events.py`, `report.py` + tests.
 Acceptance: against a `FakeClient`: `at` offsets are measured from the last trigger match;
