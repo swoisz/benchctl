@@ -1,0 +1,75 @@
+# Generic ESP-IDF profile: an esp_console REPL on the UART console.
+# Install as ~/.config/benchctl/profiles/<name>/profile.toml, or as <repo>/.benchctl/profile.toml
+# for one project, then adapt the prompt, commands and patterns to your firmware.
+
+[profile]
+name = "esp-idf"
+chip = "esp32s3"                   # esptool chip name
+
+[console]
+baud = 115200
+line_ending = "\r"                 # what the Enter key sends; the REPL ends a line on it
+prompt = "esp32s3> "               # exactly as printed, trailing space included
+timeout = 8.0
+
+[boot]
+# ready defaults to the prompt; give a regex here when the shell prints a ready line earlier
+settle = 2.5
+ready_timeout = 20.0
+probe = ""
+probe_interval = 1.0
+expected_reset_window = 10.0
+ms_regression = 1000
+
+[[identity.field]]
+name = "fw_version"
+source = "boot"
+regex = 'App version:\s*(\S+)'
+
+[[identity.field]]
+name = "project"
+source = "boot"
+regex = 'Project name:\s*(\S+)'
+
+[commands.version]
+description = "IDF and chip version"
+send = "version"
+capture = true
+
+[commands.free]
+description = "Free heap"
+send = "free"
+capture = true
+
+[commands.tasks]
+description = "FreeRTOS task list"
+send = "tasks"
+capture = true
+
+[commands.log-level]
+description = "Set a tag's log level: log-level tag=wifi level=debug"
+send = "log_level {tag} {level}"
+capture = true
+
+[commands.restart]
+description = "Software reset"
+send = "restart"
+reboots = true
+
+[[deny]]
+pattern = '^deep_sleep\b'
+reason = "the console stops answering until the unit wakes"
+
+[[redact]]
+name = "password"
+pattern = '(password["\s:=]+)[^",\s]+'
+
+[flash]
+baud = 460800
+before = "default-reset"
+after = "hard-reset"
+
+[env_gate]
+timeout = 60.0
+require = ['sta ip: \d+\.\d+\.\d+\.\d+']
+forbid = ['Guru Meditation Error', 'abort\(\) was called']
