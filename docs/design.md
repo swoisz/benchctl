@@ -175,7 +175,8 @@ Unit names are path components: `[A-Za-z0-9][A-Za-z0-9_.-]*`, and `runs` is rese
    `BENCHCTL_DAEMON_ARGV` (space-separated) replaces the program only; `--unit U` is always
    appended. It is the test seam that lets the CLI tests spawn `tests/fake_daemon.py`. The
    spawned daemon inherits the environment, so `BENCHCTL_PORTS_FILE` (Section 7.4) reaches
-   it too; the client's `--profile` reaches it as `BENCHCTL_PROFILE`.
+   it too; the client's `--profile` reaches it as `BENCHCTL_PROFILE`, and every later
+   client names its own profile in `hello` so the daemon can refuse another (Section 7.2).
 3. Poll for the socket every 100 ms up to `attach_timeout` (default 15 s). Then `hello`.
    A spawned daemon that exits with any status but 3 failed to start: its last stderr line
    in `daemon.log` is the Section 7.1 error JSON, which the client re-raises (an
@@ -488,7 +489,13 @@ booting for > boot.ready_timeout, or unknown  → probe: send boot.probe + line_
   exception is direct-mode `capture`, which has no reader: the CLI redacts its lines
   (Section 4.11).
 - `cmd --secret` replaces the TX meta text with `<redacted>` regardless of patterns
-  (`wifi set <ssid> <pass>`).
+  (`wifi set <ssid> <pass>`), and the session adds the exact sent line to a per-session
+  literal mask the reader applies, before the patterns, to every device line and meta text
+  it stores and to the tail: the shell's echo is stored as `demo> <redacted>`. The mask
+  lives as long as the session, because a `--no-wait` echo lands after `cmd` returned and a
+  later line repeating the command is as secret as the first. It matches the whole sent
+  line only; a shell that echoes it altered (character by character, truncated) is a v1
+  ceiling. `monitor` has no secret entry: typed lines are logged as sent.
 
 ### 4.9 Transport and reconnect (`transport.py`)
 
@@ -694,6 +701,9 @@ def validate_paths(paths: list[Path]) -> list[dict[str, object]]: ... # the `val
 - Announces the budget: `budget` if declared, else the sum of step timeouts plus `at`
   offsets; prints `worst case: 25m (declared) / 23m40s (computed)` and warns when the
   declared value is smaller than the computed one.
+- Before the preconditions: `status` (unit, attach time), then `identity` — the probe runs
+  here, not lazily inside the first `mark`, so `fw`/`dev` tag the run's records and
+  `results.md` even when the run itself attached — then the first `mark`.
 - Preconditions: `fw_version` regex against `identity.fw_version`; `env_gate = true` runs
   `gate_check(since=boot, timeout=env_gate.timeout)` from the profile. Failures stop the run
   before step 1 (result `precondition_failed`, exit 1).
@@ -730,7 +740,7 @@ def validate_paths(paths: list[Path]) -> list[dict[str, object]]: ... # the `val
   steps, during the preconditions, during an undo, during the final log fetch): the current
   step (or undo) becomes `error`, the remaining steps `skip`, the remaining undos still run,
   and `run_scenario` returns `fail` with the run dir written; it does not re-raise. Before
-  the preconditions (run dir setup, `status`, the first `mark`) there is nothing to undo and
+  the preconditions (run dir setup, `status`, `identity`, the first `mark`) there is nothing to undo and
   the interrupt propagates. SIGTERM is caught only in the main thread and the previous
   handler is restored on return.
 - Output: run dir (Section 7.6). The runner subscribes to the daemon's event stream for the
@@ -826,6 +836,14 @@ Invocation: `benchctl <verb> [options] [args]`. Every verb accepts `--unit U`
 `--profile P` (`BENCHCTL_PROFILE`), `--quiet` (no stderr heartbeat), `--timeout S` where a
 wait is involved. `monitor` has no `--json`.
 
+The daemon redacts and deny-lists with the profile it was spawned with, so a verb that
+loads a profile for its own rendering and deny check (`cmd`, `monitor`, `run`, `flash`)
+names that file in `hello`, and another file than the daemon's is refused with `usage`:
+`daemon for U runs profile Y (<path>); this command resolved X; pass --profile Y or detach
+first`. Every other verb (`status`, `detach`, `mark`, `wait`, `log`, `reset`, `identity`,
+`lease`, `capture`) names none and is never refused, whatever `--profile` says, so the way
+out is always open.
+
 Exit codes: `0` ok · `1` assertion failed / timeout / step failure · `2` usage, invalid
 profile or scenario, deny-listed command · `3` unit busy (lease) · `4` port, device,
 esptool or daemon error.
@@ -847,7 +865,7 @@ the same information in one or a few lines; the heartbeat (`benchctl: waiting 20
 | `units` | | `units: [{unit, profile, port: str\|null, candidates: int, daemon: bool, lease: {owner, since, last_seen}\|null}]` — `candidates > 1` flags an ambiguous match |
 | `attach` | `--take`, `--no-verify`, `--timeout S` (daemon start bound, default 15) | the `status` object; identity mismatch exits 4 with the `Identity` in `error.data.identity` |
 | `detach` | | `detached: true`; `detached: false` when no daemon was running (exit 0) |
-| `status` | | `daemon: {pid, since, port, connected, baud}, lease, identity: {fields, verified, mismatches}, last_reset: ResetInfo, offset, gate: {state, since, method}, session_dir` — every field `null` when not attached |
+| `status` | | `daemon: {pid, since, port, connected, baud}, profile: {name, path}, lease, identity: {fields, verified, mismatches}, last_reset: ResetInfo, offset, gate: {state, since, method}, session_dir` — every field `null` when not attached |
 | `mark` | `[NAME]` | `offset, name: str\|null` |
 | `cmd` | `LINE` or `--name MAP [--arg k=v]…`, `--expect RE`, `--error RE` (repeatable), `--capture`, `--no-wait`, `--reboots`, `--secret`, `--force`, `--timeout S` (default `console.timeout`). Default mode with none of `--expect`/`--capture`/`--no-wait`: capture to the prompt when the profile has one, else fire-and-forget | `offset` (tx), `status: ok\|error\|timeout`, `line`, `groups`, `captured`, `duration` — `status != ok` exits 1 |
 | `wait` | `[PATTERN]`, `--since CURSOR` (required), `--timeout S` (default 60), `--absent RE`, `--window S` (sent only when given; see the rules below), `--order "A,B,…"` | `result, line, groups, offset, t, duration, order: [offsets]` — `timeout`/`*_violated` exit 1 |
@@ -855,7 +873,7 @@ the same information in one or a few lines; the heartbeat (`benchctl: waiting 20
 | `flash` | `ARTIFACTS…` (build dir \| `flasher_args.json` \| `addr=file` pairs), `--only name,…` (`app,bootloader,partition-table,otadata`), `--after hard-reset\|no-reset`, `--baud N` | `files: [FlashFile], app: AppDesc, baud, duration, reset` |
 | `capture` | `--reset` (required in v1), `--seconds N`, `--out FILE` | `lines: [LogLine], reset: ResetInfo\|null` |
 | `log` | `--since CURSOR` (default `attach`), `--until CURSOR` (exclusive), `--grep RE`, `--limit N` (default 10000), `--tail` (follow; text mode only) | `lines: [{offset, t, ts, text}], next: offset`; offline (no daemon) adds `file` and resolves only `attach`, `boot` and offsets — a mark name is `usage` |
-| `monitor` | | interactive: live lines; typed lines are sent as `cmd --no-wait` (logged `source: "monitor"`); `!reset` resets; `Ctrl-]` exits. Line-oriented in v1 (no device-side tab completion) |
+| `monitor` | | interactive: live lines; typed lines are sent as `cmd --no-wait` (logged `source: "monitor"`, never secret: a password goes through `cmd --secret`); `!reset` resets; `Ctrl-]` exits. Line-oriented in v1 (no device-side tab completion) |
 | `run` | `SCENARIO`, `--run-dir D`, `--dry-run` (validate + budget only), `--skip-gate`, `--var k=v` (template vars for `send`/`run`) | `run_dir, result: pass\|fail\|precondition_failed, budget: {declared, computed}, steps: [{index, name, kind, result, duration, detail}]` — `fail` exits 1 |
 | `validate` | `PATH…` (profile dir, `profile.toml`, scenario file; a dir with `scenarios/` validates them all) | `files: [{path, kind: profile\|scenario\|units, ok, errors: [str]}]` — any error exits 2; no hardware |
 | `lease` | `--take` \| `--release` | `lease: object\|null` (`null` after release or with no daemon) |
@@ -904,7 +922,7 @@ offset; `cmd` prints the captured text or the matched line; `wait` prints the ma
 
 | op | args | result |
 |---|---|---|
-| `hello` | `owner, client` | `daemon: str, proto: 1, unit, offset, lease, owner_ok: bool` |
+| `hello` | `owner, client, profile?` (the resolved `profile.toml` path the client will render and deny-check with; absent when the verb loaded none) | `daemon: str, proto: 1, unit, offset, lease, owner_ok: bool, profile: {name, path}`; a `profile` that is not the daemon's own file (paths compared resolved) is `usage` and the connection stays un-greeted |
 | `status` | | `Status` |
 | `mark` | `name?` | `offset, name` |
 | `resolve` | `cursor` | `offset` |
@@ -1197,8 +1215,10 @@ the runner applies the per-kind default — `cmd`: the step's, else the map entr
 5 m; `mark`: 0 — the same numbers `compute_budget` sums, plus each `at`; a `wait` counts
 `max(timeout, window)`. A `cmd` step's `expect`/`capture` pair replaces the map entry's as
 a unit (a step `expect` must not inherit the map's `capture`), a non-empty step `error`
-replaces the map's, `reboots` is the map's (`Command.expect_regex`/`error_regexes` for the
-map's, Section 4.3). `wait.window` is sent only when declared (`None` otherwise): with
+replaces the map's, `reboots` is the map's and has no step key: a `cmd` step that reboots
+the unit sets `expect_reset = true` and `capture = false`, and a following `wait` reads the
+boot (`Command.expect_regex`/`error_regexes` for the map's, Section 4.3). `wait.window` is
+sent only when declared (`None` otherwise): with
 `absent` alone the daemon watches for `timeout`; with a pattern, `absent` is watched until
 the match, and a declared `window` extends the watch past the match (Section 7.1). Relative
 `artifacts`/`files` paths and `external.cwd` resolve against the cwd of `benchctl run`,
@@ -1206,7 +1226,11 @@ not the scenario file (scenarios live under `<config>`; builds live in the check
 `{var}` placeholders in `send`, `run` and `undo` are filled from `--var`; before step 1 the
 runner checks every placeholder has a var and every var is used by some step (usage, exit
 2), then renders each template with only its own placeholders (`render` rejects unused
-args).
+args). Only those three keys are templates, and `{` has no escape (a `${VAR}` or awk
+`{print}` in `run` is a placeholder error): a brace-bearing shell line goes in a script
+file, `env` values, `cwd`, `artifacts` and `files` are literal, and an `external` step's
+secrets come from the environment `benchctl run` inherited. A value seen in the log
+(a message id) cannot be captured into a later step in v1.
 
 ---
 
