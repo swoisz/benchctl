@@ -1,0 +1,60 @@
+[project]
+name = "benchctl"
+dynamic = ["version"]
+description = "Bench harness for ESP-IDF units: one daemon per serial port, stateless CLI clients"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "pyserial>=3.5",
+    "esptool>=5,<6",
+    "click>=8,<9",
+]
+
+[project.scripts]
+benchctl = "benchctl.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "ruff",
+    "mypy",
+    "types-pyserial",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "src/benchctl/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/benchctl"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]
+
+[tool.mypy]
+strict = true
+files = ["src", "tests"]
+python_version = "3.12"
+mypy_path = "src"
+
+[[tool.mypy.overrides]]
+module = "esptool.*"
+ignore_missing_imports = true
+
+# Wave-1 modules (U3) that the scaffold's stubs and fixtures name only under TYPE_CHECKING
+# or lazily. Inert once those files exist; lets the scaffold type-check on its own.
+[[tool.mypy.overrides]]
+module = ["benchctl.profile", "benchctl.scenario"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["tests"]
