@@ -352,7 +352,9 @@ Port of hail's `RxBuf`/`take_line`/`strip_ansi`/`classify`:
   trimmed line; empty → skip; error if the line **contains** any error marker; success if
   it **starts with** a non-empty success marker (hail semantics). benchctl's `cmd --expect`
   is a regex instead; the map's `expect` string is compiled as `re.escape(expect)` anchored
-  with `^`, which preserves hail behaviour for existing maps.
+  with `^\s*` (hail matched the trimmed line), which preserves hail behaviour for existing
+  maps. The conversion lives in U3 (`Command.expect_regex`, `Command.error_regexes`);
+  `Session.cmd` only ever sees regexes.
 
 ### 4.4 ESP-IDF detection (`idf.py`)
 
@@ -581,21 +583,31 @@ def capture_direct(port_path: str, baud: int, seconds: float, lines: ModemLines 
 def run_scenario(client: DeviceClient, scenario: Scenario, profile: Profile, *, run_dir: Path,
                  variables: dict[str, str], skip_gate: bool, dry_run: bool,
                  prompt_out: TextIO) -> RunResult: ...
-def compute_budget(scenario: Scenario) -> float: ...
+def compute_budget(scenario: Scenario, profile: Profile) -> float: ...   # profile supplies the cmd default (Section 7.8)
 
 # artifacts.py (U3), used by cli.py and runner.py
 def resolve(specs: list[str], only: list[str] | None, overrides: dict[str, str]) -> tuple[list[tuple[int, str, str]], dict[str, str]]: ...
 def read_app_desc(path: str) -> AppDesc | None: ...
 def sha256_file(path: str) -> tuple[str, int]: ...
+# resolve: paths come back absolute, sorted by address; relative specs resolve against the cwd,
+# flasher_args.json entries against the json's directory; flash_args always has all three keys
+# ("keep" when the build sets none); overrides take hyphen or underscore keys.
 
 # profile.py / registry.py / scenario.py (U3)
 def load_profile(name_or_path: str | None, cwd: Path, config_dir: Path) -> Profile: ...
 def render(template: str, args: dict[str, str]) -> str: ...          # hail's render: missing/unused args are errors
+def placeholders(template: str) -> list[str]: ...                    # the {name}s of a template, for subsetting --var
 def load_registry(config_dir: Path) -> Registry: ...
-def list_ports() -> list[ListPortInfo]: ...   # the only comports() caller; BENCHCTL_PORTS_FILE seam (Section 7.4)
+def list_ports() -> list[ListPortInfo]: ...   # the only comports() caller; BENCHCTL_PORTS_FILE seam (Section 7.4); a missing or malformed ports file is DeviceError
 def match_port(spec: dict[str, str], ports: list[ListPortInfo]) -> str: ...   # raises DeviceError naming candidates
+def matching_ports(spec: Mapping[str, str], ports: list[ListPortInfo]) -> list[ListPortInfo]: ...   # `units` candidates count
 def load_scenario(path: Path) -> Scenario: ...
 def validate_paths(paths: list[Path]) -> list[dict[str, object]]: ... # the `validate` verb's result rows
+# Invalid config raises ConfigError(UsageError) with data["errors"], one "<file>: <path>: <message>" each.
+# On the loaded objects: Registry.unit(name | None) (None = the only unit, else usage);
+# Profile.command(name), Profile.check_allowed(line) (usage "denied: <reason>"), Profile.flash.chip,
+# FlashConfig.overrides (hyphen keys, for resolve), Command.expect_regex / Command.error_regexes
+# (Section 4.3), Step.flash_specs (a flash step's inputs in resolve form).
 ```
 
 ---
@@ -812,13 +824,13 @@ daemon resolves strings through `Session.resolve` before dispatch; an unknown ma
 ```toml
 [profile]
 name = "esp-idf"              # required
-chip = "esp32s3"              # esptool chip name; required for flash
+chip = "esp32s3"              # esptool chip name; required for flash (loaded as Profile.flash.chip)
 
 [console]
 baud = 115200                 # default 115200
 line_ending = "\r"            # TX line ending; default "\r\n"
 prompt = "demo> "          # optional; enables capture-until-prompt and prompt gating
-timeout = 8.0                 # default cmd reply timeout, seconds
+timeout = 8.0                 # cmd reply timeout, seconds; default 5.0 (hail's)
 tx_chunk = 64                 # bytes per write
 tx_chunk_delay_ms = 10
 
@@ -864,20 +876,26 @@ before = "default-reset"      # esptool connect mode
 after = "hard-reset"          # default; "no-reset" allowed
 # flash_mode / flash_size / flash_freq override flasher_args.json when set
 
-[env_gate]
-timeout = 90.0
+[env_gate]                    # optional; Profile.env_gate is None without it
+timeout = 90.0                # default 60.0
 require = ['got ip', 'MQTT connected']            # regexes that must appear since the cursor
 forbid = ['PARTITION MISMATCH']                   # regexes that must not appear since the cursor
 ```
 
 Validation rules: unknown keys are errors (`deny_unknown_fields` semantics, as hail);
-`capture` and `expect` are exclusive; `expect` non-empty; `redact` patterns compile and
-have ≤1 group; `reset_patterns` define `reason`; durations are seconds as numbers in the
-profile (scenarios use duration strings). Errors are reported as `<file>: <toml path>:
-<message>`.
+`capture` and `expect` are exclusive; `capture` needs `console.prompt`; `expect` non-empty;
+every regex compiles and no list entry (`error`, `require`, `forbid`, `reset_patterns`) is
+empty; `redact` patterns compile and have ≤1 group; `redact.name`, `deny.reason` and
+identity `source` are required; an identity `regex` has ≥1 group, `source = "cmd"` needs
+`send`, `source = "boot"` takes neither `send` nor `filter`; `reset_patterns` define
+`reason`; durations are seconds as numbers in the profile (scenarios use duration strings).
+Errors are reported as `<file>: <toml path>: <message>`, array entries numbered from 1
+(`deny[2].pattern`); every problem in a file is reported in one pass.
 
-Lookup order for `<name>`: `--profile` (path to a dir or `profile.toml`) → `.benchctl/`
-walked up from the cwd (`.benchctl/profile.toml`) → `<config>/profiles/<name>/profile.toml`.
+Lookup order for `<name>`: `--profile` (path to a dir or `profile.toml`; a bare word that
+is a directory under the cwd counts as a path) → `.benchctl/profile.toml` walked up from the
+cwd, used when no name was asked for or its `[profile].name` equals the name → `<config>/
+profiles/<name>/profile.toml` (the file's `name` need not equal the directory's).
 
 ### 7.4 `units.toml` **[portable]**
 
@@ -906,7 +924,9 @@ objects with the keys `device, vid, pid, serial_number, location, manufacturer, 
 description` (`vid`/`pid` ints or null, the rest strings or null); each becomes a
 `ListPortInfo(device, skip_link_detection=True)` with those attributes set and `hwid =
 usb_info()`. ptys never appear in `comports()`, so this is how a fake device is found; the
-match `vid`/`pid` strings compare against `f"{vid:04x}"` case-insensitively.
+match `vid`/`pid` are strings of up to four hex digits (`0x` prefix allowed), compared
+against `f"{vid:04x}"` case-insensitively; a TOML integer is rejected, because `6010` and
+`0x6010` are indistinguishable once parsed.
 
 ### 7.5 `events.jsonl` **[portable]**
 
@@ -1032,11 +1052,30 @@ kind = "mark"
 name = "after_flash"
 ```
 
-Durations: `^\d+(\.\d+)?(ms|s|m|h)?$`; a bare number is seconds. Validation: `kind` in the
-set; kind-specific required keys present (`human`: `prompt`, `confirm`; `external`: `run`;
-`cmd`: `send` xor `command`; `wait`: one of `pattern`/`absent`/`order`; `flash`: `artifacts`
-xor `files`; `mark`: `name`); `since` resolvable (mark names must be defined by an earlier
-`mark` step or be one of the keywords); unknown keys are errors.
+Durations: `^\d+(\.\d+)?(ms|s|m|h)?$`; a bare number is seconds. `at` is `+<duration>`; the
+`+` is required. Validation: `kind` in the set; kind-specific required keys present
+(`human`: `prompt`, `confirm`; `external`: `run`; `cmd`: `send` xor `command`, `args` only
+with `command`, `capture = true` exclusive with `expect`; `wait`: one of
+`pattern`/`absent`/`order`; `flash`: `artifacts` xor `files`, `only` only with `artifacts`;
+`mark`: `name`, which may not be a cursor keyword (`attach`, `boot`, `prev`, `step`,
+`trigger`) or an integer); `since` resolvable (mark names must be defined by an earlier
+`mark` step or be one of the keywords); every `expect`/`error`/`pattern`/`absent`/`order`/
+`confirm` entry is a regex that compiles; unknown keys are errors. Errors are
+`<file>: step[n].<key>: <message>` with `n` from 1, the number `results.md` shows.
+
+Loader output (what the runner receives): durations as float seconds; `Step.index` from 1;
+`Step.trigger` defaults true for `human`/`wait`; `Step.timeout` is `None` when absent and
+the runner applies the per-kind default — `cmd`: the step's, else the map entry's, else
+`console.timeout`; `wait`: 60 s; `human`: 10 m; `external`: 60 s; `reset`: 5 s; `flash`:
+5 m; `mark`: 0 — the same numbers `compute_budget` sums. A `cmd` step's own
+`expect`/`error`/`capture` override the map entry's (`Command.expect_regex`/`error_regexes`
+for the map's, Section 4.3). `wait.window` defaults to the step's timeout. Relative
+`artifacts`/`files` paths and `external.cwd` resolve against the cwd of `benchctl run`,
+not the scenario file (scenarios live under `<config>`; builds live in the checkout).
+`{var}` placeholders in `send`, `run` and `undo` are filled from `--var`; before step 1 the
+runner checks every placeholder has a var and every var is used by some step (usage, exit
+2), then renders each template with only its own placeholders (`render` rejects unused
+args).
 
 ---
 
@@ -1089,7 +1128,10 @@ hail's config/render cases pass (see U2); `render` rejects missing and unused ar
 (hyphen-normalised flags, `--only` filtering, sha256 per file) and parses `AppDesc` from a
 synthetic image; the registry picks exactly one port from a synthetic `comports()` list and
 reports ambiguity; `list_ports()` reads `BENCHCTL_PORTS_FILE` when set and the `registry`
-fixture's unit resolves to `fakedev.path` through it. U3 may delete the
+fixture's unit resolves to `fakedev.path` through it; `Command.expect_regex` turns a map
+literal into an anchored escaped regex (a metacharacter in `expect` does not match as a
+pattern); a broken `.benchctl/profile.toml` of another name does not block a named lookup;
+an integer `vid`/`pid` in `units.toml` is a path-qualified error. U3 may delete the
 `benchctl.profile`/`benchctl.scenario` mypy override in `pyproject.toml` once those modules
 exist.
 
