@@ -226,6 +226,7 @@ class Client:
         attach_timeout: float = ATTACH_TIMEOUT_S,
         on_progress: ProgressHook | None = None,
         spawn_profile: str | None = None,
+        profile_path: str | None = None,
         client_name: str = "cli",
     ) -> None:
         self.unit = paths.check_unit_name(unit)
@@ -234,6 +235,9 @@ class Client:
         self.attach_timeout = attach_timeout
         self.on_progress = on_progress
         self.spawn_profile = spawn_profile
+        # The profile file this client renders and deny-checks with; the daemon refuses a
+        # hello naming another than its own (Section 7.2).
+        self.profile_path = profile_path
         self.client_name = client_name
         self._channel: Channel | None = None
         self._hello: dict[str, Any] = {}
@@ -246,11 +250,30 @@ class Client:
         """Open the connection if needed; returns the `hello` result. Raises NotAttached when
         no daemon answers and `spawn` is off."""
         if self._channel is None:
-            self._channel = Channel(self._open_socket())
-            self._hello = self._exchange(
-                self._channel, "hello", {"owner": self.owner, "client": self.client_name}
-            )
+            channel, self._hello = self._greet()
+            self._channel = channel
         return self._hello
+
+    def _greet(self) -> tuple[Channel, dict[str, Any]]:
+        """A new connection that has said hello; closed again when the hello is refused."""
+        channel = Channel(self._open_socket())
+        try:
+            return channel, self._exchange(channel, "hello", self._hello_args())
+        except BaseException:
+            channel.close()
+            raise
+
+    @property
+    def profile(self) -> dict[str, Any] | None:
+        """The daemon's profile `{name, path}` from `hello`; None before connecting."""
+        profile = self._hello.get("profile")
+        return profile if isinstance(profile, dict) else None
+
+    def _hello_args(self) -> dict[str, Any]:
+        args: dict[str, Any] = {"owner": self.owner, "client": self.client_name}
+        if self.profile_path is not None:
+            args["profile"] = self.profile_path
+        return args
 
     def close(self) -> None:
         if self._channel is not None:
@@ -371,7 +394,7 @@ class Client:
         self.owner, self.client_name = owner, client
         if self._channel is None:
             return self.connect()
-        self._hello = self._exchange(self._channel, "hello", {"owner": owner, "client": client})
+        self._hello = self._exchange(self._channel, "hello", self._hello_args())
         return self._hello
 
     def status(self) -> Status:
@@ -477,8 +500,7 @@ class Client:
     def tail(self, since: Offset | str, events: bool) -> Subscription:
         """Stream from a second connection: one connection carries one request at a time and
         a tail never ends on its own. Closing the Subscription closes that connection."""
-        channel = Channel(self._open_socket())
-        self._exchange(channel, "hello", {"owner": self.owner, "client": self.client_name})
+        channel, _ = self._greet()
         feed = Subscription()
         channel.send({"id": "tail", "op": "tail", "args": {"since": since, "events": events}})
         threading.Thread(

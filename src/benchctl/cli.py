@@ -86,6 +86,7 @@ class Opts:
     quiet: bool
     _registry: Registry | None = None
     _unit: Unit | None = None
+    _profile: Profile | None = None
     _clients: list[Client] = field(default_factory=list)
 
     @property
@@ -106,9 +107,11 @@ class Opts:
         return self._unit.name if self._unit is not None else self.unit_arg
 
     def profile(self, preferred: str | None = None) -> Profile:
-        """`--profile`, else `preferred` (a scenario's), else the unit's default."""
-        name = self.profile_arg or preferred or self.unit.profile
-        return load_profile(name, Path.cwd(), paths.config_dir())
+        """`--profile`, else `preferred` (a scenario's), else the unit's default; loaded once."""
+        if self._profile is None:
+            name = self.profile_arg or preferred or self.unit.profile
+            self._profile = load_profile(name, Path.cwd(), paths.config_dir())
+        return self._profile
 
     def client(
         self,
@@ -118,12 +121,16 @@ class Opts:
         attach_timeout: float = ATTACH_TIMEOUT_S,
         spawn_profile: str | None = None,
     ) -> Client:
+        # Only a verb that loaded a profile names it in hello; resolving --profile just to
+        # send it would refuse `detach` and `status` on a mismatch, the way out of one.
+        loaded = None if self._profile is None else str(self._profile.path)
         client = Client(
             self.unit.name,
             spawn=spawn,
             attach_timeout=attach_timeout,
             on_progress=heartbeat,
-            spawn_profile=spawn_profile or self.profile_arg,
+            spawn_profile=spawn_profile or loaded or self.profile_arg,
+            profile_path=loaded,
         )
         self._clients.append(client)
         return client
@@ -199,7 +206,7 @@ def _reset_text(reset: ResetInfo) -> str:
     return f"{reset.offset} rst:{code} ({reset.reason}) {kind}"
 
 
-def _status_fields(status: Status) -> dict[str, Any]:
+def _status_fields(status: Status, profile: dict[str, Any] | None) -> dict[str, Any]:
     identity = status.identity
     return {
         "daemon": {
@@ -209,6 +216,7 @@ def _status_fields(status: Status) -> dict[str, Any]:
             "connected": status.connected,
             "baud": status.baud,
         },
+        "profile": profile,
         "lease": status.lease or None,
         "identity": None
         if identity is None
@@ -228,13 +236,15 @@ def _status_fields(status: Status) -> dict[str, Any]:
     }
 
 
-def _status_text(status: Status) -> str:
+def _status_text(status: Status, profile: dict[str, Any] | None) -> str:
     link = "connected" if status.connected else "DISCONNECTED"
     lines = [
         f"{status.unit}: attached since {status.attached_at} (pid {status.pid}) "
         f"on {status.port or '?'}, {link}, {status.baud} baud",
-        _lease_text(status.lease or None),
     ]
+    if profile is not None:
+        lines.append(f"profile: {profile.get('name')} ({profile.get('path')})")
+    lines.append(_lease_text(status.lease or None))
     if status.identity is not None:
         values = " ".join(f"{k}={v}" for k, v in status.identity.fields.items())
         verdict = "verified" if status.identity.verified else "UNVERIFIED"
@@ -403,11 +413,22 @@ def status(opts: Opts) -> int:
         client.connect()
     except NotAttached:
         fields: dict[str, Any] = dict.fromkeys(
-            ("daemon", "lease", "identity", "last_reset", "offset", "gate", "session_dir")
+            (
+                "daemon",
+                "profile",
+                "lease",
+                "identity",
+                "last_reset",
+                "offset",
+                "gate",
+                "session_dir",
+            )
         )
         return _finish(opts, fields, f"{opts.unit.name}: not attached")
     result = client.status()
-    return _finish(opts, _status_fields(result), _status_text(result))
+    return _finish(
+        opts, _status_fields(result, client.profile), _status_text(result, client.profile)
+    )
 
 
 @main.command()
@@ -572,7 +593,9 @@ def attach(opts: Opts, take: bool, no_verify: bool, timeout: float) -> int:
         client.lease("take")
     client.identity(False, override=no_verify)
     result = client.status()
-    return _finish(opts, _status_fields(result), _status_text(result))
+    return _finish(
+        opts, _status_fields(result, client.profile), _status_text(result, client.profile)
+    )
 
 
 @main.command()

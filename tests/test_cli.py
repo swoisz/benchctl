@@ -18,7 +18,7 @@ from benchctl.client import DAEMON_ARGV_ENV, daemon_pid
 from benchctl.lease import OWNER_ENV, PortLock
 from benchctl.runner import RunResult
 from benchctl.types import FlashFile, FlashResult, LogLine
-from conftest import UNIT, install_profile
+from conftest import PROFILE_NAME, UNIT, install_profile
 from fake_daemon import (
     APP_VERSION,
     FAKE_DAEMON_ENV,
@@ -32,7 +32,16 @@ from fakedev import FakeDevice
 EXAMPLES = Path(__file__).resolve().parent.parent / "examples"
 SCENARIO = EXAMPLES / "scenarios" / "boot_banner.toml"
 OTHER_MAC = "11:22:33:44:55:66"
-STATUS_KEYS = {"daemon", "lease", "identity", "last_reset", "offset", "gate", "session_dir"}
+STATUS_KEYS = {
+    "daemon",
+    "profile",
+    "lease",
+    "identity",
+    "last_reset",
+    "offset",
+    "gate",
+    "session_dir",
+}
 RESET_KEYS = {
     "offset",
     "t",
@@ -184,6 +193,8 @@ def test_attach_spawns_once_and_returns_status(bench: Path) -> None:
     assert set(data["last_reset"]) == RESET_KEYS
     assert data["gate"]["state"] == "ready"
     assert data["lease"]["owner"] == "alice"
+    assert data["profile"]["name"] == PROFILE_NAME
+    assert data["profile"]["path"].endswith(f"/profiles/{PROFILE_NAME}/profile.toml")
     pid = data["daemon"]["pid"]
     assert run_json("attach")["daemon"]["pid"] == pid  # a second attach reuses the daemon
     status = run_json("status")
@@ -371,6 +382,28 @@ def _empty_ports(state_dir: Path) -> Path:
     path = state_dir / "ports.json"
     path.write_text("[]")
     return path
+
+
+# --- profile handshake --------------------------------------------------------------------
+
+
+def test_a_client_with_another_profile_is_refused_until_detach(
+    bench: Path, config_dir: Path
+) -> None:
+    source = config_dir / "profiles" / PROFILE_NAME / "profile.toml"
+    other = config_dir / "profiles" / "other" / "profile.toml"
+    other.parent.mkdir(parents=True)
+    other.write_text(source.read_text().replace(f'name = "{PROFILE_NAME}"', 'name = "other"'))
+    run_json("attach")
+    refused = run_json("cmd", "version", "--profile", "other", code=2)
+    assert_error(refused, "usage")
+    assert refused["error"]["message"].startswith(
+        f"daemon for {UNIT} runs profile {PROFILE_NAME} ("
+    )
+    assert refused["error"]["message"].endswith(f"pass --profile {PROFILE_NAME} or detach first")
+    assert run_json("status", "--profile", "other")["profile"]["name"] == PROFILE_NAME
+    assert invoke("status").stdout.splitlines()[1].startswith(f"profile: {PROFILE_NAME} (")
+    assert run_json("detach", "--profile", "other")["detached"] is True
 
 
 # --- identity mismatch ---------------------------------------------------------------------

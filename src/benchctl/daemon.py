@@ -422,6 +422,17 @@ class Daemon:
 
     def _op_hello(self, args: _Args, conn: _Conn, req: _Request) -> dict[str, Any]:
         owner = args.req_text("owner")
+        own = self.session.profile
+        profile = {"name": own.name, "path": str(own.path)}
+        # Redaction and the deny list are this profile's; a client rendering with another
+        # would believe checks the daemon does not run. Refused before greeting.
+        wanted = args.text("profile")
+        if wanted is not None and Path(wanted).resolve() != own.path.resolve():
+            raise UsageError(
+                f"daemon for {self.unit.name} runs profile {own.name} ({own.path}); "
+                f"this command resolved {wanted}; pass --profile {own.name} or detach first",
+                data={"daemon_profile": profile, "client_profile": wanted},
+            )
         conn.owner = owner
         return {
             "daemon": f"benchctl {__version__}",
@@ -430,6 +441,7 @@ class Daemon:
             "offset": self.session.status().offset,
             "lease": self.lease.current(),
             "owner_ok": self.lease.owner_ok(owner),
+            "profile": profile,
         }
 
     def _op_status(self, args: _Args, conn: _Conn, req: _Request) -> dict[str, Any]:

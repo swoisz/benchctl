@@ -98,7 +98,9 @@ with `benchctl attach --take` or `benchctl lease --take`. A lease left idle for 
 ## Verbs
 
 Every verb takes `--unit U` (default: the only registered unit), `--profile P`, `--json`
-(except `monitor`) and `--quiet`.
+(except `monitor`) and `--quiet`. The daemon keeps the profile it was spawned with
+(`status` shows it): `cmd`, `monitor`, `run` and `flash` with a different `--profile` exit
+2 until you `detach`.
 
 | Verb | Use |
 |---|---|

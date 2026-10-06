@@ -1,5 +1,5 @@
 """Behaviour the unit tests could not reach: `cmd --no-wait` on the real session, and a client
-`--profile` that differs from the running daemon's."""
+`--profile` that differs from the running daemon's, which the daemon refuses."""
 
 from __future__ import annotations
 
@@ -15,7 +15,6 @@ SLOW_DEVICE_S = 60.0  # the fake answers `slow` after this many device seconds
 SLOW_REPLY_S = SLOW_DEVICE_S * TIMESCALE  # 3 s of wall time
 OTHER = "other"
 OTHER_DENY = "denied by other"
-EXAMPLE_DENY = "the console stops answering until the unit wakes"
 
 
 def test_cmd_no_wait_returns_at_tx(bench: Bench) -> None:
@@ -48,24 +47,24 @@ def install_other_profile(config: Path) -> None:
 
 
 def test_client_profile_against_a_daemon_running_another(bench: Bench) -> None:
-    """Records current behaviour: nothing detects the mismatch. The client's --profile drives
-    the client-side checks; the daemon keeps the profile it was spawned with for its own
-    deny check and for redaction, and neither hello nor status names it."""
+    """The daemon keeps the profile it was spawned with. A verb that renders or deny-checks
+    with another (`cmd`) is refused before anything is sent; `status` names the daemon's
+    profile and, like `detach`, works whatever `--profile` says."""
     device = bench.add_unit(UNIT)
     install_other_profile(bench.config)
     bench.cli("attach")  # the daemon runs the unit's profile
 
-    denied = bench.cli("cmd", "version", "--profile", OTHER, code=2)
-    assert denied["error"]["message"] == f"denied: {OTHER_DENY}"  # the client's deny list
-    refused = bench.cli("cmd", "deep_sleep", "--profile", OTHER, code=2)
-    assert refused["error"]["message"] == f"denied: {EXAMPLE_DENY}"  # the daemon's
-    reply = bench.cli("cmd", "secret", "--profile", OTHER)
-    assert reply["captured"] == "sip_user=bench sip_pass=***"  # OTHER's sip_user rule unused
-    status = bench.cli("status", "--profile", OTHER)
+    # OTHER denies `version` client-side before any connection (see the end of this test).
+    refused = bench.cli("cmd", "secret", "--profile", OTHER, code=2)
+    assert f"runs profile {PROFILE_NAME}" in refused["error"]["message"]
+    for args in (("status",), ("status", "--profile", OTHER)):
+        status = bench.cli(*args)
+        assert status["profile"]["name"] == PROFILE_NAME
     assert set(status) == {
         "ok",
         "unit",
         "daemon",
+        "profile",
         "lease",
         "identity",
         "last_reset",
@@ -73,14 +72,17 @@ def test_client_profile_against_a_daemon_running_another(bench: Bench) -> None:
         "gate",
         "session_dir",
     }
-    assert shell_lines(device) == ["secret"]
-    assert bench.cli("detach")["detached"] is True
+    assert shell_lines(device) == []
+    assert bench.cli("detach", "--profile", OTHER)["detached"] is True
 
     # The verb that spawns the daemon picks its profile, and it outlives that verb.
     bench.cli("mark", "--profile", OTHER)
-    reply = bench.cli("cmd", "secret")
+    assert bench.cli("status")["profile"]["name"] == OTHER
+    reply = bench.cli("cmd", "secret", "--profile", OTHER)
     assert reply["captured"] == "sip_user=*** sip_pass=***"
-    refused = bench.cli("cmd", "version", code=2)
-    assert refused["error"]["message"] == f"denied: {OTHER_DENY}"
-    assert shell_lines(device) == ["secret", "secret"]
+    mismatch = bench.cli("cmd", "version", code=2)  # resolves the unit's default profile
+    assert f"runs profile {OTHER}" in mismatch["error"]["message"]
+    denied = bench.cli("cmd", "version", "--profile", OTHER, code=2)
+    assert denied["error"]["message"] == f"denied: {OTHER_DENY}"
+    assert shell_lines(device) == ["secret"]
     assert bench.cli("detach")["detached"] is True

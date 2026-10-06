@@ -50,7 +50,9 @@ benchctl detach                         # stops the daemon; serial.log stays on 
 
 Every verb takes `--json` (one object on stdout) and `--unit U` (default: the only registered
 unit). Exit codes: `0` ok, `1` assertion failed or timeout, `2` usage or invalid config,
-`3` unit busy (another owner holds the lease), `4` port, device or daemon error.
+`3` unit busy (another owner holds the lease), `4` port, device or daemon error. The
+daemon keeps the profile it was spawned with, and `status` shows it; `cmd`, `monitor`, `run`
+and `flash` with a different `--profile` are refused until `benchctl detach`.
 
 [`SKILL.md`](SKILL.md) is the full usage guide: verbs, cursors, leases, and the mark → act →
 wait pattern. It is also a Claude Code skill, so an agent can drive the bench with it.

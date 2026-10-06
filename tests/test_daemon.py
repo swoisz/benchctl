@@ -18,7 +18,7 @@ from benchctl.client import Channel, Client
 from benchctl.errors import BenchctlError, BusyError, DeviceError, UsageError
 from benchctl.lease import PortLock
 from benchctl.types import LogLine
-from conftest import UNIT, install_profile
+from conftest import PROFILE_NAME, UNIT, install_profile
 from fake_daemon import (
     APP_VERSION,
     FAKE_DAEMON_ENV,
@@ -109,7 +109,11 @@ def exchange(channel: Channel, request: dict[str, Any]) -> dict[str, Any]:
 # --- protocol ----------------------------------------------------------------------------
 
 
-def test_first_request_must_be_hello(served: Served) -> None:
+def installed_profile(config: Path) -> Path:
+    return config / "profiles" / PROFILE_NAME / "profile.toml"
+
+
+def test_first_request_must_be_hello(served: Served, config: Path) -> None:
     channel = raw_channel()
     reply = exchange(channel, {"id": "1", "op": "status", "args": {}})
     assert reply["ok"] is False
@@ -123,6 +127,26 @@ def test_first_request_must_be_hello(served: Served) -> None:
     assert isinstance(result["offset"], int)
     assert result["lease"] is None
     assert result["owner_ok"] is True
+    assert result["profile"] == {"name": PROFILE_NAME, "path": str(installed_profile(config))}
+    channel.close()
+
+
+def test_hello_refuses_another_profile(served: Served, config: Path) -> None:
+    channel = raw_channel()
+    other = {"owner": "a", "profile": "/elsewhere/profile.toml"}
+    refused = exchange(channel, {"id": "1", "op": "hello", "args": other})
+    assert refused["ok"] is False
+    assert refused["error"]["code"] == "usage"
+    assert refused["error"]["message"].startswith(f"daemon for {UNIT} runs profile ")
+    assert refused["error"]["data"]["client_profile"] == "/elsewhere/profile.toml"
+    status = exchange(channel, {"id": "2", "op": "status", "args": {}})
+    assert status["error"] == {
+        "code": "protocol",
+        "message": "first request must be hello",
+        "data": {},
+    }
+    own = {"owner": "a", "profile": str(installed_profile(config))}
+    assert exchange(channel, {"id": "3", "op": "hello", "args": own})["ok"] is True
     channel.close()
 
 
