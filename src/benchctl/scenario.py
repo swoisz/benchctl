@@ -242,6 +242,10 @@ def _cmd(t: Table, base: Step) -> Step:
 def _wait(t: Table, base: Step, marks: set[str]) -> Step:
     if not any(t.has(key) for key in ("pattern", "absent", "order")):
         t.error(None, "needs at least one of pattern, absent and order")
+    if t.has("pattern") and t.has("order"):
+        t.error(None, "pattern and order are exclusive")
+    if t.has("window") and not t.has("absent"):
+        t.error("window", "only applies with absent")
     order: list[str] | None = None
     if t.has("order"):
         if t.data["order"] == []:

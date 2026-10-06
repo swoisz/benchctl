@@ -87,6 +87,7 @@ fw_version = '^1\\.7'
 [[step]]
 kind = "wait"
 pattern = "ready"
+absent = "rst:"
 timeout = "250ms"
 window = 30
 trigger = false
@@ -204,6 +205,14 @@ name = "m1"
         ("[[step]]\nkind = 'wait'\ntimeout = '5s'\n", "step[1]: needs at least one of pattern"),
         ("[[step]]\nkind = 'wait'\npattern = '('\n", "step[1].pattern: invalid regex"),
         ("[[step]]\nkind = 'wait'\norder = []\n", "step[1].order: must not be empty"),
+        (
+            "[[step]]\nkind = 'wait'\npattern = 'a'\norder = ['b', 'c']\n",
+            "step[1]: pattern and order are exclusive",
+        ),
+        (
+            "[[step]]\nkind = 'wait'\npattern = 'a'\nwindow = '5s'\n",
+            "step[1].window: only applies with absent",
+        ),
         ("[[step]]\nkind = 'wait'\npattern = 'x'\nsince = 'nope'\n", "step[1].since: unknown mark"),
         ("[[step]]\nkind = 'wait'\npattern = 'x'\nsince = '812'\n", "step[1].since: unknown mark"),
         ("[[step]]\nkind = 'flash'\n", "step[1]: needs exactly one of artifacts and files"),
