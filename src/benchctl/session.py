@@ -153,6 +153,7 @@ class DeviceSession:
         self._baud = profile.console.baud
         self._prompt = profile.console.prompt
         self._redactor = Redactor(rule.pattern for rule in profile.redact)
+        self._secrets: list[str] = []  # whole `cmd --secret` lines, masked for the session
         self._path = port or registry.match_port(self._match, registry.list_ports())
         transport = PySerialTransport.open(self._path, self._baud, lines)
         try:
@@ -258,12 +259,18 @@ class DeviceSession:
 
     def _note(self, text: str) -> LogLine:
         with self._cond:
-            line = self._store.append(self._redactor.apply(text), meta=True)
+            line = self._store.append(self._mask(text), meta=True)
             self._offer(line)
             return line
 
     def note(self, text: str) -> Offset:
         return self._note(text).offset
+
+    def _mask(self, text: str) -> str:
+        """Incoming text as it may be stored: secret lines first, then the profile patterns."""
+        for secret in self._secrets:
+            text = text.replace(secret, REDACTED)
+        return self._redactor.apply(text)
 
     def _emit_gate(self, changes: list[GateState]) -> None:
         for state in changes:
@@ -317,10 +324,10 @@ class DeviceSession:
 
     def _on_data(self, data: bytes) -> None:
         texts = self._engine.feed(data)
-        tail = self._redactor.apply(self._engine.tail)
+        tail = self._mask(self._engine.tail)
         with self._cond:
             for text in texts:
-                self._store_device_line(self._redactor.apply(text))
+                self._store_device_line(self._mask(text))
             if self._store.set_tail(tail):
                 self._emit_gate(self._gate.on_tail(tail, self._store.now()))
 
@@ -650,6 +657,11 @@ class DeviceSession:
                 transport = self._transport
                 if transport is None:
                     raise DeviceError("port not connected")
+                # Registered under the Condition, before the bytes go out, so the reader cannot
+                # store the shell's echo of the line unmasked.
+                masked = line.rstrip()
+                if secret and masked and masked not in self._secrets:
+                    self._secrets.append(masked)
                 if reboots:
                     self._arm(f"cmd:{shown}")
                 tx = self._note(f"tx {shown}")
@@ -686,7 +698,8 @@ class DeviceSession:
         `shown` is the line as it may appear in errors (redacted, or `<redacted>`)."""
         if mode == "none":
             return "ok", None, [], None
-        echoes = {sent.rstrip(), self._redactor.apply(sent).rstrip()}
+        # A secret line's echo is stored masked, ending in `<redacted>`.
+        echoes = {sent.rstrip(), self._redactor.apply(sent).rstrip(), shown.rstrip()}
         prompt = self._prompt or ""
         pos = tx_offset + 1
         seen_line = False

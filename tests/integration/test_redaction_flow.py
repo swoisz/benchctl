@@ -3,8 +3,6 @@
 
 from __future__ import annotations
 
-import pytest
-
 from conftest import UNIT
 from fakedev import SECRET
 from integration.conftest import Bench
@@ -45,12 +43,6 @@ def test_secrets_stay_out_of_json_events_and_daemon_log(bench: Bench) -> None:
     assert SECRET not in bench.daemon_log(UNIT)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="DeviceSession.cmd masks only the `## tx` meta text for --secret; the shell's echo "
-    "of the line is a device line, which _on_data/_store_device_line redact with the profile "
-    "patterns alone, so the secret lands in serial.log and in log/wait output",
-)
 def test_secret_line_echo_stays_out_of_serial_log_and_log_json(bench: Bench) -> None:
     secret_session(bench)
     log = bench.run("log", "--since", "attach", "--json")

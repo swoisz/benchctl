@@ -561,6 +561,26 @@ def test_pause_reader_parks_and_a_port_closed_underneath_recovers(
 # --- redaction, identity, env gate, feeds ----------------------------------------------------
 
 
+def test_secret_echo_is_masked_in_store_and_serial_log(ready_session: DeviceSession) -> None:
+    result = cmd(ready_session, f"wifi set bench {SECRET}", secret=True)
+    assert (result.status, result.captured) == ("ok", "command not found")
+    stored = texts(ready_session)
+    assert stored[result.tx_offset] == "## tx <redacted>"
+    assert stored[result.tx_offset + 1] == f"{PROMPT}<redacted>"
+    assert not any(SECRET in text for text in stored)
+    ready_session.close()
+    serial_log = (ready_session.session_dir / "serial.log").read_text(encoding="utf-8")
+    assert SECRET not in serial_log
+
+
+def test_secret_echo_after_no_wait_is_masked(ready_session: DeviceSession) -> None:
+    # Fire and forget: cmd returns at the TX, and the echo is stored after it returned.
+    sent = cmd(ready_session, f"wifi set bench {SECRET}", secret=True, capture=False)
+    until(lambda: len(texts(ready_session)) > sent.tx_offset + 1)
+    assert texts(ready_session)[sent.tx_offset + 1] == f"{PROMPT}<redacted>"
+    assert not any(SECRET in text for text in texts(ready_session))
+
+
 def test_redaction_happens_before_storage(ready_session: DeviceSession) -> None:
     result = cmd(ready_session, "secret")
     assert result.captured == "sip_user=bench sip_pass=***"
