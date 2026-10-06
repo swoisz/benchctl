@@ -172,28 +172,37 @@ Unit names are path components: `[A-Za-z0-9][A-Za-z0-9_.-]*`, and `runs` is rese
 2. `ENOENT`/`ECONNREFUSED` → remove a stale socket file if the pidfile's process is dead →
    spawn the daemon: `Popen([sys.executable, "-m", "benchctl", "daemon", "--unit", U],
    start_new_session=True, stdin=DEVNULL, stdout=stderr=<state>/<unit>/daemon.log)`.
-   `BENCHCTL_DAEMON_ARGV` (space-separated) replaces the argv; it is the test seam that
-   lets the CLI tests spawn `tests/fake_daemon.py`. The spawned daemon inherits the
-   environment, so `BENCHCTL_PORTS_FILE` (Section 7.4) reaches it too.
+   `BENCHCTL_DAEMON_ARGV` (space-separated) replaces the program only; `--unit U` is always
+   appended. It is the test seam that lets the CLI tests spawn `tests/fake_daemon.py`. The
+   spawned daemon inherits the environment, so `BENCHCTL_PORTS_FILE` (Section 7.4) reaches
+   it too; the client's `--profile` reaches it as `BENCHCTL_PROFILE`.
 3. Poll for the socket every 100 ms up to `attach_timeout` (default 15 s). Then `hello`.
+   A spawned daemon that exits with any status but 3 failed to start: its last stderr line
+   in `daemon.log` is the Section 7.1 error JSON, which the client re-raises (an
+   unregistered unit is exit 2 at once, not after the poll). Daemon startup order is lock → pidfile →
+   session → bind, so a connected client always talks to a live session.
 4. The daemon takes the port lock first (`lease.lock`, `flock(LOCK_EX|LOCK_NB)`). Two
    clients racing to spawn: the loser's daemon exits 3 within a second; the loser client's
    poll then finds the winner's socket. No TOCTOU on the port itself: the daemon opens it
    with pyserial `exclusive=True` (POSIX `flock`), so a stray `idf.py monitor` or esptool
    fails fast instead of stealing bytes, and vice versa.
-5. `attach` is this same path, run explicitly; it returns `status`.
+5. `attach` is this same path, run explicitly, followed by `identity` (mutating, so a
+   non-owner's `attach` is `busy` unless `--take`); it returns `status`.
 
 ### 3.4 Lease **[portable]**
 
 - Owner string: `BENCHCTL_OWNER` if set, else `<user>@<host>:<cwd>` where cwd is the git
   worktree root if inside one, else the plain cwd.
 - `lease.json`: `{"owner": str, "since": iso8601, "last_seen": iso8601, "daemon_pid": int}`.
-  Written by the daemon on acquire/take, and `last_seen` refreshed on every request from
-  the owner. The daemon's liveness is `lease.lock` + pid, not the heartbeat.
-- Every request carries `owner` (in `hello`). Mutating ops (`cmd`, `reset`, `flash`,
-  `mark`, `arm_reset`, `detach`, `identity`) from a different owner fail with code `busy`
-  (exit 3): `busy: held by <owner> since <since>`. Read-only ops (`status`, `log`, `wait`,
-  `tail`, `gate`) are allowed to any owner, so an agent can watch while a human types.
+  Written by the daemon on acquire/take, and `last_seen` refreshed in memory on every
+  request from the owner and flushed to disk every 5 s. The daemon's liveness is
+  `lease.lock` + pid, not the heartbeat.
+- Every request carries `owner` (in `hello`). The lease is acquired by the owner's first
+  mutating op, not by `hello`, so a watcher never holds it. Mutating ops (`cmd`, `reset`,
+  `flash`, `mark`, `arm_reset`, `detach`, `identity`, `capture`) from a different owner fail
+  with code `busy` (exit 3): `busy: held by <owner> since <since>`; so does `lease
+  --release` of a lease that is not stale. Read-only ops (`status`, `log`, `wait`, `tail`,
+  `gate`, `resolve`) are allowed to any owner, so an agent can watch while a human types.
 - Takeover: `attach --take` or `lease --take` transfers the lease (event `lease`,
   `action: "take"`). Takeover is automatic, without `--take`, when the lease is stale:
   `last_seen` older than `BENCHCTL_LEASE_STALE_S` (default 1800) or the daemon pid dead.
@@ -311,7 +320,7 @@ exists for the wire-only codes `slow_client`/`protocol` that have no subclass. S
 | main | socket accept loop, signal handling, shutdown | touch the port |
 | reader | the only `transport.read()` caller; LineEngine → Redactor → LogStore → Detector/Gate; reconnect loop | block on a client |
 | handler (per connection) | one request at a time; `cmd`/`reset`/`flash` under the device lock | read the port directly (reads go through LogStore) |
-| housekeeping | lease `last_seen` refresh (5 s), gate settle timer, LogStore fsync (1 s) | |
+| housekeeping | lease `last_seen` flush (5 s), gate settle timer, LogStore fsync (1 s) | |
 
 - **Device lock** (`threading.RLock`): held across any TX and its reply capture: `cmd`,
   `reset`, `flash`, identity probing, gate probing. `wait`, `log`, `mark`, `status` do not
@@ -388,40 +397,56 @@ Port of hail's `RxBuf`/`take_line`/`strip_ansi`/`classify`:
   record is live: `reset` op, `flash` op, a `cmd` whose map entry has `reboots = true` or
   was sent with `--reboots`, or an explicit `arm_reset(cause, window)` (the runner uses it
   for steps with `expect_reset = true`). Arming lasts `boot.expected_reset_window` (default
-  10 s) from the arming moment; `cause` is `"reset"`, `"flash"`, `"cmd:<line>"`, or the
-  runner's `"step:<n>"`.
+  10 s) from the arming moment and is consumed by the first reset it classifies, so a second
+  reboot inside the window is unexpected (a crash right after a flash must not hide behind
+  it). Attach arms `"attach"` before its one explicit pulse. An adapter that also resets on
+  open could in principle deliver that boot's `rst:` line first and spend the arm; at
+  115200 the line cannot complete before the pulse lands (~5 ms after open), so this is a
+  Section 9 bench check, not a code path. `cause` is `"attach"`, `"reset"`, `"flash"`,
+  `"cmd:<line as logged>"`, or the runner's `"step:<n>"`. Expected resets carry `context: []`.
 - Otherwise `expected: false, cause: null, context: <last 20 stored lines before it>`.
+- A reset inferred from a device-ms regression (Section 4.4) is a `reset` with `reason:
+  "unknown", code: null, boot_mode: null` and `inferred: true` on the event only.
 - The reset's `elf_sha` is filled when the SHA line arrives; `last_reset` in `status`
-  reflects it. Any reset moves the gate to `booting` and sets the `boot` cursor to the
-  reset line's offset.
+  reflects it. Any reset moves the gate to `booting` (`bootloader` when its boot mode starts
+  with `DOWNLOAD`) and sets the `boot` cursor to the reset line's offset.
 
 ### 4.6 Shell-ready gate (`gate.py`)
 
 States and transitions:
 
 ```
-attach / any reset line                       → booting   (t_boot)
+attach / any reset line / reset op            → booting   (t_boot; the op moves it before the pulse)
 ready pattern seen (line or tail)             → settling  (t_ready)
 t ≥ t_ready + console.settle                  → ready
-port_back without a reset line                → unknown
+port_lost, or port_back without a reset line  → unknown
 booting for > boot.ready_timeout, or unknown  → probe: send boot.probe + line_ending every
                                                  boot.probe_interval until the prompt is in
                                                  the tail → settling
+                                                 (no console.prompt: no probe; → settling at once)
 ```
 
 - `boot.ready` defaults to the escaped prompt when absent. The firmware today has no stable
   ready line, so the prompt plus `settle = 2.5` (an earlier bring-up finding: shell up at
   ~1.2 s, config init done at ~2.0 s, quiet by ~2.3 s) is the gate.
 - `cmd` waits for `ready` within its own timeout; failing that it returns `status:
-  "timeout"` with message `shell not ready (state=<s>)`. `cmd --force` skips the gate
-  (used by `capture`-style debugging only).
-- `bootloader`: entered after `reset --bootloader` and after `flash --after no-reset` (the
-  chip sits in the ROM bootloader or the flasher stub). No probing; `cmd` fails immediately
-  with `device` ("unit is in bootloader; run `reset`"). Left on the next reset line or
-  `reset`.
-- `cmd` capture semantics: `captured` is the stored text from `tx_offset + 1` up to the
-  prompt appearing in the tail, minus the first stored line when it ends with the sent text
-  (the shell's echo completes the pending `demo> ` into `demo> version`).
+  "timeout"` with `line` `shell not ready (state=<s>)` (or `device busy` when another op
+  holds the device lock for the whole timeout), `offset` = the next offset: nothing was sent
+  and no `## tx` line exists. `cmd --force` skips both the ready wait and the bootloader
+  refusal (used by `capture`-style debugging only).
+- `bootloader`: entered before the pulse of `reset --bootloader`, after `flash --after
+  no-reset` or a failed flash, and on any reset line whose boot mode starts with `DOWNLOAD`
+  (the chip sits in the ROM bootloader or the flasher stub). No probing; `cmd` fails
+  immediately with `device` ("unit is in bootloader; run `reset`"). Left on the next reset
+  line or `reset`.
+- `cmd` capture semantics: `captured` is the stored device text from `tx_offset + 1` up to
+  the prompt appearing in the tail, minus the echo: the first device line that ends with the
+  sent text (the shell completes the pending `demo> ` into `demo> version`; an
+  asynchronous log line landing first displaces it onto its own line). Once the echo has
+  been seen, a device line that starts with the prompt also ends the capture and is not part
+  of it: a log line printed right after the prompt turns `demo> ` into `demo> I (5000)
+  wifi: …`, and no second prompt follows. Error regexes apply to captured lines too
+  (`status: "error"`, `line` = the first hit, `captured` still filled).
 - Probing is a TX and takes the device lock; a probe line is logged as a meta line
   (`## probe`) and its reset arming is none.
 
@@ -431,14 +456,16 @@ booting for > boot.ready_timeout, or unknown  → probe: send boot.probe + line_
   includes meta lines. `attach` = 0. `boot` = offset of the most recent reset line (or 0 if
   none since attach). A mark is a name → offset mapping kept in the daemon; `mark` with no
   name returns the current offset (`== number of lines stored`, i.e. the offset the **next**
-  line will get). Marks do not survive detach.
+  line will get); `mark NAME` writes `## mark NAME` and returns that line's own offset (a
+  meta line, so a wait from it sees everything after). A name that parses as a cursor
+  (`attach`, `boot`, digits) is `usage`. Marks do not survive detach.
 - Memory holds the whole session (`list[LogLine]`); the file is the durable copy. At
   115200 baud the ceiling is ~40 MB/hour of pure text, acceptable for bench sessions; the
   design does not page to disk.
 - `serial.log` line format: `HH:MM:SS.mmm +SSSSS.mmm <text>` where `+t` is seconds since
   attach with three decimals. First line: `## attach unit=<u> port=<p> baud=<b> at=<iso>`.
 - Meta lines are benchctl's own and start with `## `: `## tx <line>` (what was sent,
-  redacted; `## tx <redacted>` when `secret`), `## reset requested bootloader=<bool>`,
+  redacted; `## tx <redacted>` when `secret`), `## reset requested bootloader=true|false`,
   `## flash begin|end …` (written by U6 through `Session.note`), `## mark <name>`,
   `## probe`, `## port lost|back …`. They occupy offsets so `cmd` can return its `tx` offset
   and a `wait --since <that>` cannot miss the reply.
@@ -457,7 +484,9 @@ booting for > boot.ready_timeout, or unknown  → probe: send boot.probe + line_
   prompt matching) and stored lines can both pass through it.
 - Applied in exactly one place: the reader, to every line before it reaches LogStore, and
   to every meta line text before it is appended. Replies, captures, waits, `log`, `tail`,
-  events, and `results.md` are all derived from stored lines, so they inherit it.
+  events, and `results.md` are all derived from stored lines, so they inherit it. The one
+  exception is direct-mode `capture`, which has no reader: the CLI redacts its lines
+  (Section 4.11).
 - `cmd --secret` replaces the TX meta text with `<redacted>` regardless of patterns
   (`wifi set <ssid> <pass>`).
 
@@ -466,17 +495,24 @@ booting for > boot.ready_timeout, or unknown  → probe: send boot.probe + line_
 - `PySerialTransport.open(path, baud)`: construct unopened `serial.Serial()`, set `port`,
   `baudrate`, `timeout=0.1`, `exclusive=True`, `dtr=False`, `rts=False`, then `open()`.
   Line state failures (`OSError ENOTTY`, as on a pty) are logged once and ignored.
-- `reset(bootloader=False)`: run → esptool's `HardReset(port)()` (RTS pulse, DTR low);
-  bootloader → `ClassicReset(port, delay=0.05)()`. Both come from `esptool.reset` so the
-  sequence is never re-implemented here. The reset strategy is a `ModemLines` callable
-  injected at construction (default pulses the real lines; tests inject a hook that calls
-  the fake device's `reset()`), because RTS/DTR ioctls fail on a pty.
+- `reset(bootloader=False)`: run → esptool's `HardReset(port)()` (RTS pulse, DTR low;
+  `uses_usb` stays False even for native-USB units, whose re-enumeration is the reconnect
+  loop's job); bootloader → `ClassicReset(port, reset_delay=0.05)()`. Both come from
+  `esptool.reset` so the sequence is never re-implemented here. The reset strategy is a
+  `ModemLines` callable injected at construction (default pulses the real lines; tests
+  inject a hook that calls the fake device's `reset()`), because RTS/DTR ioctls fail on a
+  pty. A failed pulse is `TransportLost`; `set_baud` refused by the driver is `DeviceError`.
+- Attach: write meta line 0, arm `attach`, discard whatever a reset-on-open already
+  printed (`apply_settings(get_settings())`), start the reader, then pulse one reset.
 - Loss: pyserial raises `SerialException` ("device reports readiness to read but returned
   no data") or `OSError` when the device vanishes; the transport converts both to
   `TransportLost`. The reader then: emits `port_lost`, closes, and loops every 0.5 s
   (esp-idf-monitor's cadence): re-resolve the port through `registry.list_ports()` +
   `match_port` (the path may change on native USB; zero candidates while unplugged means
-  keep looping), open with lines low, emit `port_back {path, gap}`, set gate `unknown`.
+  keep looping), open with lines low, emit `port_back {path, gap}`, set gate `unknown`
+  (already `unknown` since the loss; a `cmd` awaiting its reply when the port went raises
+  `TransportLost`, code `device`). A port esptool closed underneath reads as `TransportLost`
+  too, and `apply_settings` tolerates a closed port, so a failed flash recovers this way.
   After `reconnect_timeout` (default 120 s) it keeps trying every 5 s; `status` shows
   `connected: false`. Waits are bounded by their own timeouts regardless.
 
@@ -490,8 +526,19 @@ Facts from esptool 5.4 that fix the sequence (`esptool/__init__.py: prepare_esp_
   `esp.change_baud(baud)` when `-b` exceeds 115200, runs the command, and in teardown calls
   `reset_chip(esp, after)` but **does not close the port**. The pyserial handle is left at
   the flash baud.
+- `--before no-reset` still matters with an external `esp`: it sets `initial_baud =
+  min(115200, baud)`, which is what makes `change_baud` fire (`no-reset-no-sync` would not).
+- `reset_chip(esp, "no-reset")` on the stub calls `soft_reset(True)`: the chip **reboots into
+  the ROM loader** and prints its banner. `"no-reset-stub"` sends nothing. The teardown also
+  runs after a failed command, so a `no-reset` soft reset to a wedged stub can replace the
+  real error.
+- `ESPLoader.connect()` **closes the port** when every attempt fails.
+- `esptool.main` re-raises a non-zero `SystemExit` from click (a usage error in our argv).
 
-Daemon flash op, under the device lock:
+Daemon flash op. `flash_on_session` takes `session.device_lock()` itself (an RLock, so the
+daemon may already hold it). Bad input (`after` not in `hard-reset`/`no-reset`, unknown chip,
+`flash_args` without exactly the three keys, an unreadable file) is `UsageError` before any
+session call.
 
 The **client** resolves artifacts (`artifacts.resolve(args) -> list[(addr, path, name)]`,
 `--only` applied) and sends `files: [{addr, path, name}]`; the daemon hashes each file and
@@ -499,27 +546,40 @@ parses `AppDesc` from the entry with `name == "app"`.
 
 ```
 1. files = [FlashFile(addr, path, name, sha256(path), size)]; app = appdesc(files["app"]) if present
-   session.note(f"flash begin {' '.join(f.name for f in files)} baud={baud} after={after}")
+   begin = session.note(f"flash begin {' '.join(f.name for f in files)} baud={baud} after={after}")
 2. with session.pause_reader() as t:
 3.     settings = t.get_settings()
-4.     esp = esptool.targets.CHIP_DEFS[profile.flash.chip](t.raw, 115200)
-5.     esp.connect(profile.flash.before)                # "default-reset": DTR/RTS dance into the ROM bootloader
-6.     argv = ["--chip", chip, "--baud", str(flash.baud), "--before", "no-reset", "--after", "no-reset",
-               "write-flash", "--flash-mode", m, "--flash-size", s, "--flash-freq", f, *[hex(addr), path, ...]]
-7.     with redirect_stdout(EventLineWriter(session, "flash_log")):   # progress → events, never the tty
-8.         esptool.main(argv, esp=esp)                  # FatalError / SerialException → DeviceError(exit 4)
-9.     finally: t.apply_settings(settings)         # console baud back, pending input discarded (chip is parked in the stub: only SLIP leftovers)
-10. reader resumed. session.note(f"flash end status={ok|error} duration={d:.1f}")
+4.     with redirect_stdout(EventLineWriter(session, "flash_log")):   # connect + write output → events, never the tty
+5.         esp = esptool.targets.CHIP_DEFS[profile.flash.chip](t.raw, 115200)
+6.         esp.connect(profile.flash.before)            # "default-reset": DTR/RTS dance into the ROM bootloader
+7.         argv = ["--chip", chip, "--baud", str(flash.baud), "--before", "no-reset", "--after", "no-reset-stub",
+                   "write-flash", "--flash-mode", m, "--flash-size", s, "--flash-freq", f, *[hex(addr), path, ...]]
+8.         esptool.main(argv, esp=esp)                  # FatalError / OSError / StopIteration / SystemExit → DeviceError(exit 4)
+9.     t.apply_settings(settings)                  # console baud back, pending input discarded (chip is parked in the stub: only SLIP leftovers)
+       on failure the restore runs too but its own error is dropped: connect() closed the port, and U4's reconnect reopens it
+10. reader resumed. session.note(f"flash end status={ok|error} duration={d:.1f}")   # duration = connect + write
+    error:                 session.set_gate("bootloader", method="flash"); emit flash event {status: error, error}; re-raise
     after == "hard-reset": FlashResult.reset = session.reset(False, wait_rst=5.0, cause="flash")
-    after == "no-reset":  session.set_gate("bootloader", method="flash"); FlashResult.reset = None
-11. emit flash event
+    after == "no-reset":   session.set_gate("bootloader", method="flash"); FlashResult.reset = None
+11. emit flash event (offset = begin)
 ```
 
-- esptool is always told `--after no-reset` on the held handle. If esptool performed the hard
-  reset itself, the ROM banner would arrive at the flash baud while the reader is parked, and
-  step 9's input flush could swallow the `rst:` line. Resetting through
-  `session.reset` after the reader resumes makes the arming, the gate move, and the
-  `ResetInfo` the ordinary reset path.
+- esptool never resets the chip on the held handle: `--after no-reset-stub`. A hard reset
+  would deliver the ROM banner at the flash baud while the reader is parked, and plain
+  `no-reset` soft-resets the stub into the ROM loader, whose banner arrives after the
+  reader resumes as an unarmed `reset`. The RTS pulse of `session.reset` and the next
+  `connect("default-reset")` both work from the stub. Resetting through `session.reset`
+  after the reader resumes makes the arming, the gate move, and the `ResetInfo` the
+  ordinary reset path.
+- Every failure, including one in `pause_reader` itself, ends with `## flash end
+  status=error`, the `flash` event, and the gate in `bootloader`: the chip is in the stub,
+  the ROM loader, or somewhere unknown, so `cmd` must refuse until an explicit `reset`.
+  When the failure closed the port (a failed `connect`), the reader's reconnect moves the
+  gate on to `unknown` and probes; a chip in the ROM loader ignores the probe, so `cmd`
+  still fails (`shell not ready (state=unknown)`, exit 1 rather than 4) until `reset`.
+  esptool's errors become `DeviceError`; anything else is re-raised unchanged.
+- `flash_log` lines are esptool's stdout, not stored lines, so they bypass redaction (they
+  carry no device output).
 - `flasher_args.json` uses underscore flags (`--flash_mode`); `artifacts.py` normalises to
   esptool 5 hyphen names itself rather than relying on the deprecation shim.
 - `after` is `hard-reset` by default and `no-reset` when `--after no-reset` (for an OTA test's
@@ -528,29 +588,41 @@ parses `AppDesc` from the entry with `name == "app"`.
   segment header) with struct `<II8s32s32s16s16s32s32s` and magic `0xABCD5432`: version,
   project, time, date, idf_ver, `app_elf_sha256` (full 64 hex). Signed images keep the
   header, so this works on the signed artifacts the bench flashes.
-- Direct mode (no daemon): `esptool.main(argv_with("--port", path, "--after", after))`,
-  letting esptool open, reset and close the port (nobody is reading, so esptool's own
-  after-reset is fine). If the daemon holds the port the `exclusive` open fails →
-  `DeviceError("port busy: unit <u> daemon is running")`, exit 4. The client only takes the
-  direct path when no socket answered.
+- Direct mode (no daemon): `esptool.main(argv_with("--port", path, "--before", before,
+  "--after", after))`, letting esptool open, reset and close the port (nobody is reading, so
+  esptool's own after-reset is fine); its stdout goes to stderr so `--json` stays clean. If
+  the daemon holds the port the `exclusive` open fails → `DeviceError("port busy: <path> is
+  locked by another process …")`, exit 4 (the unit name is not known here). `FlashResult.reset`
+  is `None`. The client only takes the direct path when no socket answered.
 
 ### 4.11 Capture (`capture.py`)
 
-- Daemon mode: `reset` then `wait`-style collection of lines for `--seconds N` since the
-  reset's offset; returns the slice.
+- `seconds <= 0` is `UsageError` in both modes.
+- Daemon mode: `start = session.mark(None)`, then `session.reset(False, wait_rst=min(N, 5.0))`,
+  sleep out the remainder of N, `end = session.mark(None)`, return `session.log(start, …)`
+  up to `end`. The window starts at the reset request so it holds the `## reset requested`
+  meta line and the ROM banner that precedes `rst:`, as direct mode does. No device lock is
+  held across the window; the lines are stored lines, so redacted.
 - Direct mode: open the port, reset through `lines` (default: esptool `HardReset` on the
   handle), read for N seconds through `linebuf.LineEngine`, return `LogLine`s with `offset`
   counted from 0 and `t` since the reset call. Output format equals `log`'s text format.
   `capture_direct` opens `serial.Serial` itself with the Section 4.9 settings and never
   imports `transport.py`; it is the one second opener in the tree, so U6 depends on U2 but
-  not on U4.
+  not on U4. A locked port is `DeviceError("port busy: …")`; a port that vanishes
+  mid-capture is `DeviceError`. **Its lines are unredacted**: the CLI applies the profile's
+  `Redactor` before printing (the one exception to Section 4.8's single site).
 
 ### 4.12 Identity (`session.identity`)
 
-- After the gate first reaches `ready` post-attach, run each `[[identity.field]]`:
-  `source = "boot"` → regex over stored lines since `boot`; `source = "cmd"` → `cmd(send,
-  capture=True)` then optional `filter` (shell command, stdin = capture, stdout = text to
-  match) then regex group 1.
+- On the first `identity()` call (after the gate reaches `ready`; the session does not run
+  it by itself — the daemon calls it from `attach` and before the first mutating op when
+  the session has not probed yet, so an auto-attaching `cmd` or `mark` is verified too),
+  run each `[[identity.field]]`: `source = "boot"` →
+  regex over stored device lines since `boot`; `source = "cmd"` → `cmd(send, capture=True)`
+  (without a prompt: `cmd(send, expect=<regex>)` and the matched line) then optional
+  `filter` (shell command, stdin = capture, stdout = text to match) then regex group 1. A
+  field that yields nothing is absent from `fields` and compares as `""`. Cached until
+  `reprobe`.
 - Compare with `units.<u>.expect` (Section 7.4). Any mismatch → `Identity.verified = false`,
   event `identity` with `mismatches`, and **attach fails with exit 4** (`identity mismatch:
   mac expected X got Y`). The daemon stays up and keeps the port (no other process grabs
@@ -558,8 +630,8 @@ parses `AppDesc` from the entry with `name == "app"`.
   `device` and the same message until `attach --no-verify` clears it (event `identity`,
   `verified: true, override: true`) or `detach`. Read-only ops still work so the operator
   can inspect what is actually plugged in.
-- `fw_version` and `device_id` (first present of `expect.id_field`, default `mac`, then
-  `cert_cn`) tag every event.
+- `fw_version` (`fw`) and the device id (`dev`: `expect.id_field` when set, else the first
+  present of `mac`, `cert_cn`) tag every event emitted after identity ran.
 
 ### 4.13 Cross-unit entry points
 
@@ -580,9 +652,12 @@ def capture_direct(port_path: str, baud: int, seconds: float, lines: ModemLines 
 # runner.py (U7)
 @dataclass class RunResult: run_dir: Path; result: Literal["pass","fail","precondition_failed"];
                             budget: dict[str, float | None]; steps: list[dict[str, object]]
+                            def to_json(self, unit: str) -> dict[str, object]: ...   # the 7.1 `run` result fields with `ok`/`unit`; summary.json
 def run_scenario(client: DeviceClient, scenario: Scenario, profile: Profile, *, run_dir: Path,
                  variables: dict[str, str], skip_gate: bool, dry_run: bool,
                  prompt_out: TextIO) -> RunResult: ...
+# Raises UsageError before any client call for a missing/unused --var, an unknown map command, a bad
+# template, or a denied line. dry_run stops after those checks and the budget line: no client call, no run dir.
 def compute_budget(scenario: Scenario, profile: Profile) -> float: ...   # profile supplies the cmd default (Section 7.8)
 
 # artifacts.py (U3), used by cli.py and runner.py
@@ -625,18 +700,39 @@ def validate_paths(paths: list[Path]) -> list[dict[str, object]]: ... # the `val
 - Steps run sequentially. `at = "+Ns"` sleeps until `trigger_t + N` where `trigger_t` is
   the match time of the most recent trigger (a `wait` or `human` step with `trigger =
   true`, the default for both); with no trigger yet, from scenario start. A step without
-  `at` starts when the previous step ends.
+  `at` starts when the previous step ends. The trigger moves only on a matched line
+  (`match`/`order_ok`, the last match); `absent_ok` leaves it. The matched line's device `t`
+  is mapped onto the runner's clock from the streamed items' arrival times, so `trigger_t`
+  can be late by the delivery delay but never early; the wait's return time is the ceiling.
 - `wait.since` resolution: `"prev"` (default) = offset recorded at the start of the previous
-  step; `"step"` = now; `"trigger"` = offset of the last trigger match; `"boot"`,
-  `"attach"`, or a mark name.
+  step; `"step"` = now; `"trigger"` = offset of the last trigger match (the run's first
+  offset before any); `"boot"`, `"attach"`, or a mark name. The step-start offset is taken
+  after the `at` sleep.
+- `expect_reset = true` arms `arm_reset("step:<n>", span + boot.expected_reset_window)` at
+  step start, where `span` (`runner.step_span`) is the step's timeout or a wait's declared
+  `window` when longer; put it on the step during which the `rst:` line is expected to
+  arrive. `compute_budget` sums the same spans.
 - `human`: print the prompt (stderr and the terminal bell), then `wait(confirm, since=step,
   timeout)`. The human never says "done".
-- `external`: `subprocess.run(run, shell=True, cwd, env, timeout)`; non-zero exit fails the
-  step. On success, if `undo` is set, push `(undo, cwd, env, timeout)`.
+- `external`: shell command in its own process group (`start_new_session`), env merged over
+  the runner's, output tails redacted; a timeout or an interrupt kills the group. Non-zero
+  exit fails the step. On success, if `undo` is set, push `(undo, cwd, env, timeout)`.
 - Undo: at scenario end, on failure, and on SIGINT/SIGTERM, pop and run every undo in
   reverse order, each bounded by its timeout; an undo failure is recorded (`external`
-  event, `phase: "undo"`) and does not stop the others. The run result is `fail` if any
-  step or undo failed.
+  event, `phase: "undo"`, and a note in `results.md`) and does not stop the others. The run
+  result is `fail` if any step or undo failed.
+- Step results: `fail` is an assertion the device did not meet (timeout, error line, no
+  `rst:` after a `reset`, non-zero exit); `error` is a `BenchctlError`/`OSError` or an
+  interrupt; steps after a stop are `skip` with the reason in `detail` (`not run: step 3
+  failed`), and after a failed precondition every step is `skip`. `continue_on_fail` keeps
+  going after `fail`/`error`, but never after an interrupt.
+- SIGINT/SIGTERM anywhere from the preconditions to the report (during a step, between
+  steps, during the preconditions, during an undo, during the final log fetch): the current
+  step (or undo) becomes `error`, the remaining steps `skip`, the remaining undos still run,
+  and `run_scenario` returns `fail` with the run dir written; it does not re-raise. Before
+  the preconditions (run dir setup, `status`, the first `mark`) there is nothing to undo and
+  the interrupt propagates. SIGTERM is caught only in the main thread and the previous
+  handler is restored on return.
 - Output: run dir (Section 7.6). The runner subscribes to the daemon's event stream for the
   run's duration and is the **sole writer** of the run dir's `events.jsonl` (daemon events
   passed through, plus the runner's own `run`, `step`, `human`, `external` records). The
@@ -737,6 +833,10 @@ esptool or daemon error.
 Error JSON (any verb, any non-zero exit except `monitor`):
 `{"ok": false, "error": {"code": "usage|busy|device|timeout|assert|internal", "message": str, "data": {...}}}`
 on stdout; code → exit: `usage`→2, `busy`→3, `device`/`internal`→4, `timeout`/`assert`→1.
+A verb whose *result* is the failure (`cmd` not ok, `wait` timeout or violation, `run` not
+pass, `validate` errors) prints `{"ok": false, "unit", <its result fields>, "error": {...}}`,
+so the fields stay readable next to the verdict. `unit` is `null` when the verb loaded no
+unit (`validate`).
 
 Success JSON is `{"ok": true, "unit": str, ...}` with verb fields below. Text mode prints
 the same information in one or a few lines; the heartbeat (`benchctl: waiting 20/600 s for
@@ -745,30 +845,37 @@ the same information in one or a few lines; the heartbeat (`benchctl: waiting 20
 | Verb | Options / args | JSON result fields |
 |---|---|---|
 | `units` | | `units: [{unit, profile, port: str\|null, candidates: int, daemon: bool, lease: {owner, since, last_seen}\|null}]` — `candidates > 1` flags an ambiguous match |
-| `attach` | `--take`, `--no-verify` | the `status` object |
-| `detach` | | `detached: true` |
-| `status` | | `daemon: {pid, since, port, connected, baud}, lease, identity: {fields, verified}, last_reset: ResetInfo, offset, gate: {state, since}, session_dir` |
+| `attach` | `--take`, `--no-verify`, `--timeout S` (daemon start bound, default 15) | the `status` object; identity mismatch exits 4 with the `Identity` in `error.data.identity` |
+| `detach` | | `detached: true`; `detached: false` when no daemon was running (exit 0) |
+| `status` | | `daemon: {pid, since, port, connected, baud}, lease, identity: {fields, verified, mismatches}, last_reset: ResetInfo, offset, gate: {state, since, method}, session_dir` — every field `null` when not attached |
 | `mark` | `[NAME]` | `offset, name: str\|null` |
 | `cmd` | `LINE` or `--name MAP [--arg k=v]…`, `--expect RE`, `--error RE` (repeatable), `--capture`, `--no-wait`, `--reboots`, `--secret`, `--force`, `--timeout S` (default `console.timeout`). Default mode with none of `--expect`/`--capture`/`--no-wait`: capture to the prompt when the profile has one, else fire-and-forget | `offset` (tx), `status: ok\|error\|timeout`, `line`, `groups`, `captured`, `duration` — `status != ok` exits 1 |
-| `wait` | `[PATTERN]`, `--since CURSOR` (required), `--timeout S` (default 60), `--absent RE`, `--window S` (default = timeout), `--order "A,B,…"` | `result, line, groups, offset, t, duration, order: [offsets]` — `timeout`/`*_violated` exit 1 |
-| `reset` | `--bootloader` | `offset, reset: ResetInfo\|null` (waits ≤5 s for the rst line) |
+| `wait` | `[PATTERN]`, `--since CURSOR` (required), `--timeout S` (default 60), `--absent RE`, `--window S` (sent only when given; see the rules below), `--order "A,B,…"` | `result, line, groups, offset, t, duration, order: [offsets]` — `timeout`/`*_violated` exit 1 |
+| `reset` | `--bootloader`, `--timeout S` (rst-line wait, default 5) | `offset` (before the request), `reset: ResetInfo\|null` |
 | `flash` | `ARTIFACTS…` (build dir \| `flasher_args.json` \| `addr=file` pairs), `--only name,…` (`app,bootloader,partition-table,otadata`), `--after hard-reset\|no-reset`, `--baud N` | `files: [FlashFile], app: AppDesc, baud, duration, reset` |
 | `capture` | `--reset` (required in v1), `--seconds N`, `--out FILE` | `lines: [LogLine], reset: ResetInfo\|null` |
-| `log` | `--since CURSOR` (default `attach`), `--until CURSOR`, `--grep RE`, `--limit N` (default 10000), `--tail` (follow; text mode only) | `lines: [{offset, t, ts, text}], next: offset` |
+| `log` | `--since CURSOR` (default `attach`), `--until CURSOR` (exclusive), `--grep RE`, `--limit N` (default 10000), `--tail` (follow; text mode only) | `lines: [{offset, t, ts, text}], next: offset`; offline (no daemon) adds `file` and resolves only `attach`, `boot` and offsets — a mark name is `usage` |
 | `monitor` | | interactive: live lines; typed lines are sent as `cmd --no-wait` (logged `source: "monitor"`); `!reset` resets; `Ctrl-]` exits. Line-oriented in v1 (no device-side tab completion) |
 | `run` | `SCENARIO`, `--run-dir D`, `--dry-run` (validate + budget only), `--skip-gate`, `--var k=v` (template vars for `send`/`run`) | `run_dir, result: pass\|fail\|precondition_failed, budget: {declared, computed}, steps: [{index, name, kind, result, duration, detail}]` — `fail` exits 1 |
 | `validate` | `PATH…` (profile dir, `profile.toml`, scenario file; a dir with `scenarios/` validates them all) | `files: [{path, kind: profile\|scenario\|units, ok, errors: [str]}]` — any error exits 2; no hardware |
-| `lease` | `--take` \| `--release` | `lease` object |
-| `identity` | `--reprobe` | `Identity` (`fields, verified, mismatches`) |
+| `lease` | `--take` \| `--release` | `lease: object\|null` (`null` after release or with no daemon) |
+| `identity` | `--reprobe` | `Identity` (`fields, verified, mismatches`); a mismatch on an un-overridden daemon exits 4 |
 | `daemon` | `--unit U` (hidden; foreground) | — |
 
 Cursor grammar (`--since`, `--until`): `attach` · `boot` · a non-negative integer · a mark
 name. Unknown mark → `usage`.
 
 `wait` argument rules: `PATTERN` is required unless `--order` or `--absent` is given;
-`--absent` alone checks absence over `--window`; `PATTERN` + `--absent` requires the
-pattern to match and the absent pattern not to appear before it; `--order` requires each
-pattern to match after the previous match. All matches are `re.search` on stored text.
+`PATTERN` and `--order` are exclusive (`usage`); `--absent` alone checks absence over
+`--window` (default: the timeout); `PATTERN` + `--absent` requires the pattern to match and
+the absent pattern not to appear before it, and a given `--window` then extends the absence
+watch to `window` seconds from the call even past the match, so the wait returns at the
+later of the two. `--window` means nothing without `--absent`: a plain pattern or order
+wait returns at its match whatever window was sent. `--order` requires each pattern to
+match after the previous match; `order_violated` (a later pattern seen before an earlier one
+that never followed) is decided at the timeout, and a pattern never seen is `timeout`. All
+matches are `re.search` on stored **device** lines; `## ` meta lines are never matched
+(`log --grep` does include them).
 
 Deny-list: a `cmd` whose rendered line matches a `[[deny]]` pattern is refused with code
 `usage`, message `denied: <reason>`, exit 2; nothing is sent.
@@ -789,8 +896,9 @@ offset; `cmd` prints the captured text or the matched line; `wait` prints the ma
   - `{"id", "ok": false, "error": {"code", "message", "data"}}` — codes as in 7.1 plus
     `slow_client`, `protocol` (both map to exit 4).
   - `{"id", "progress": {"elapsed": float, "offset": int, "note": str}}` every 5 s during
-    blocking ops (`cmd`, `wait`, `flash`, `gate`, `identity`) so the client can distinguish
-    a slow wait from a dead daemon.
+    blocking ops (`cmd`, `wait`, `flash`, `gate`, `identity`, `reset`, `capture`, and any op
+    that triggers the first identity probe) so the client can distinguish a slow wait from
+    a dead daemon; the client gives up (`device`) after 30 s without any frame.
   - `{"id", "line": LogLine}` and `{"id", "event": Event}` for `tail`.
 - Ops and args (`result` is the dataclass from 4.1 as JSON unless stated):
 
@@ -807,10 +915,10 @@ offset; `cmd` prints the captured text or the matched line; `wait` prints the ma
 | `arm_reset` | `cause, window` | `{}` |
 | `flash` | `files: [{addr, path, name}], after, baud, flash_args: {flash-mode, flash-size, flash-freq}` (client-resolved) | `FlashResult` |
 | `capture` | `seconds` | `lines, reset` |
-| `identity` | `reprobe` | `Identity` |
+| `identity` | `reprobe, override` (`attach --no-verify`: accept a mismatch for this daemon's life) | `Identity`; a mismatch without override is `device` |
 | `gate` | `since, timeout` | `ok: bool, missing: [str], forbidden_hits: [{pattern, line, offset}]` |
 | `tail` | `since, events: bool` | stream |
-| `lease` | `action: take\|release` | lease object |
+| `lease` | `action: take\|release` | `{"lease": object\|null}` |
 | `detach` | | `{}` then the daemon exits |
 
 Owner enforcement per 3.4: `hello` records the connection's owner; mutating ops check it.
@@ -943,6 +1051,10 @@ One JSON object per line. Common fields on every record:
 | `type` | str | one of the types below |
 | `offset` | int\|null | log offset the record refers to |
 
+Who writes what: the session emits `attach`, `gate`, `reset`, `elf_sha`, `tx`, `mark`,
+`port_lost`, `port_back` and `identity`; the daemon emits `reply`, `wait`, `lease`,
+`detach` and `flash`/`flash_log` (through U6); the runner the rest.
+
 Per-type fields:
 
 | type | fields |
@@ -950,15 +1062,15 @@ Per-type fields:
 | `attach` | `port, baud, pid, owner, session_dir` |
 | `detach` | `reason` |
 | `identity` | `fields: {…}, verified, mismatches: {field: [expected, got]}` |
-| `reset` | `code, reason, boot_mode, elf_sha, expected, cause, context: [str]` |
+| `reset` | `code, reason, boot_mode, elf_sha, expected, cause, context: [str], inferred: bool` |
 | `elf_sha` | `sha, boot_offset` (when the SHA line follows the reset) |
 | `gate` | `state, method: pattern\|probe\|flash\|null` |
-| `tx` | `line, source: cmd\|monitor\|probe\|identity\|runner, request_id` |
+| `tx` | `line, source: cmd\|monitor\|probe\|identity\|runner, request_id: null` (the session writes it and knows no request; the daemon's `reply` carries `request_id` with `offset` = the tx offset) |
 | `reply` | `request_id, status, line, groups, captured, duration` |
 | `mark` | `name` |
 | `wait` | `request_id, pattern, since, result, line, groups, duration, order` |
-| `flash` | `files: [FlashFile], app: AppDesc, baud, after, duration, status: ok\|error, error` |
-| `flash_log` | `line` (esptool stdout, one record per line) |
+| `flash` | `files: [FlashFile], app: AppDesc\|null, baud, after, duration, status: ok\|error, error: str\|null`; `offset` = the `## flash begin` line |
+| `flash_log` | `line` (esptool stdout, one record per non-blank line, `\r` progress updates included; not redacted) |
 | `port_lost` | `error` |
 | `port_back` | `path, gap` |
 | `lease` | `action: acquire\|take\|release\|stale, owner, prev_owner` |
@@ -977,8 +1089,14 @@ profile.toml       # copy of the resolved profile
 serial.log         # slice of the session log from the run's first offset to its last, same line format
 events.jsonl       # Section 7.5, runner-filtered to the run's time span plus runner records
 results.md         # Section 7.7
-summary.json       # the `run` --json result
+summary.json       # RunResult.to_json: the `run` --json fields with ok/unit, minus the CLI's `error` object
 ```
+
+Six files. `serial.log` is fetched once at the end through paged `log` calls, after the
+undos and before the `run` end record, so that record's `result` reflects an interrupted
+fetch (`fail`, with a note); `events.jsonl` holds daemon events only while the run is
+subscribed, dropping any whose `offset` precedes the run's first offset. A dry run creates
+no run dir.
 
 ### 7.7 `results.md`
 
@@ -995,7 +1113,15 @@ summary.json       # the `run` --json result
 Resets: 1 expected (step 2), 0 unexpected. Run dir: `<path>`.
 ```
 
-Evidence is the matched line (redacted, truncated to 120 chars) and its offset.
+Evidence is the matched line (redacted, truncated to 120 chars) and its offset: a `wait`
+or `human` shows its matched line; a `cmd` its `## tx` line (none when the shell was not
+ready and nothing was sent); a `reset` or `flash` its `rst:` line; an `external` its exit.
+Step names come from `name`, else from the unrendered template, so `--var` values never
+reach the report. `t (s)` is scenario start (after the preconditions) to the step's end;
+skipped steps show `-`. A reset is attributed to the step whose start offset is the last
+one at or before it, so one arriving during a later step's `at` sleep counts against the
+step before it, as in the example. Notes (precondition failure, failed undos, an
+incomplete `serial.log`) sit between the table and the `Resets:` line, one bullet each.
 
 ### 7.8 Scenario TOML **[portable]**
 
@@ -1056,20 +1182,25 @@ Durations: `^\d+(\.\d+)?(ms|s|m|h)?$`; a bare number is seconds. `at` is `+<dura
 `+` is required. Validation: `kind` in the set; kind-specific required keys present
 (`human`: `prompt`, `confirm`; `external`: `run`; `cmd`: `send` xor `command`, `args` only
 with `command`, `capture = true` exclusive with `expect`; `wait`: one of
-`pattern`/`absent`/`order`; `flash`: `artifacts` xor `files`, `only` only with `artifacts`;
-`mark`: `name`, which may not be a cursor keyword (`attach`, `boot`, `prev`, `step`,
-`trigger`) or an integer); `since` resolvable (mark names must be defined by an earlier
-`mark` step or be one of the keywords); every `expect`/`error`/`pattern`/`absent`/`order`/
-`confirm` entry is a regex that compiles; unknown keys are errors. Errors are
-`<file>: step[n].<key>: <message>` with `n` from 1, the number `results.md` shows.
+`pattern`/`absent`/`order`, `pattern` exclusive with `order`, `window` only with `absent`;
+`flash`: `artifacts` xor `files`, `only` only with `artifacts`; `mark`: `name`, which may not be a cursor keyword
+(`attach`, `boot`, `prev`, `step`, `trigger`) or an integer); `since` resolvable (mark names
+must be defined by an earlier `mark` step or be one of the keywords); every
+`expect`/`error`/`pattern`/`absent`/`order`/`confirm` entry is a regex that compiles;
+unknown keys are errors. Errors are `<file>: step[n].<key>: <message>` with `n` from 1,
+the number `results.md` shows.
 
 Loader output (what the runner receives): durations as float seconds; `Step.index` from 1;
 `Step.trigger` defaults true for `human`/`wait`; `Step.timeout` is `None` when absent and
 the runner applies the per-kind default — `cmd`: the step's, else the map entry's, else
 `console.timeout`; `wait`: 60 s; `human`: 10 m; `external`: 60 s; `reset`: 5 s; `flash`:
-5 m; `mark`: 0 — the same numbers `compute_budget` sums. A `cmd` step's own
-`expect`/`error`/`capture` override the map entry's (`Command.expect_regex`/`error_regexes`
-for the map's, Section 4.3). `wait.window` defaults to the step's timeout. Relative
+5 m; `mark`: 0 — the same numbers `compute_budget` sums, plus each `at`; a `wait` counts
+`max(timeout, window)`. A `cmd` step's `expect`/`capture` pair replaces the map entry's as
+a unit (a step `expect` must not inherit the map's `capture`), a non-empty step `error`
+replaces the map's, `reboots` is the map's (`Command.expect_regex`/`error_regexes` for the
+map's, Section 4.3). `wait.window` is sent only when declared (`None` otherwise): with
+`absent` alone the daemon watches for `timeout`; with a pattern, `absent` is watched until
+the match, and a declared `window` extends the watch past the match (Section 7.1). Relative
 `artifacts`/`files` paths and `external.cwd` resolve against the cwd of `benchctl run`,
 not the scenario file (scenarios live under `<config>`; builds live in the checkout).
 `{var}` placeholders in `send`, `run` and `undo` are filled from `--var`; before step 1 the
@@ -1159,8 +1290,8 @@ frontmatter (`name`, `description`) and names every CLI verb.
 
 **U6 flash and capture** — `flash.py`, `capture.py` + tests.
 Acceptance: with a fake `esptool.main` and a `FakeSession`/`FakeTransport`: the argv for a
-build dir, a `flasher_args.json`, and `addr=file` pairs matches 4.10 step 6 exactly (hyphen
-flags, `--before no-reset`, `--after no-reset`), `connect(before)` is called before `main`,
+build dir, a `flasher_args.json`, and `addr=file` pairs matches 4.10 step 7 exactly (hyphen
+flags, `--before no-reset`, `--after no-reset-stub`), `connect(before)` is called before `main`,
 the reader is paused during `main` and resumed after, transport settings are restored on
 success and on `FatalError` (which surfaces as exit 4), `## flash begin` and `## flash end`
 go through `session.note`, after the pause exits
@@ -1174,9 +1305,12 @@ since reset.
 Acceptance: against a `FakeClient`: `at` offsets are measured from the last trigger match;
 `since = "prev"` resolves to the previous step's start offset; a `human` step passes on its
 confirm line without input; `undo` commands run in reverse order after success, after a
-failed step, and on SIGINT; the run dir contains the five files of 7.6 with `results.md`
-matching 7.7; the budget line reports declared vs computed; a failed precondition writes
-`precondition_failed` and exit 1.
+failed step, on SIGINT during a step, and on SIGINT between steps; a pattern wait with
+`absent` and no `window` returns on its match, not at its timeout; the run dir contains the
+six files of 7.6 with `results.md` matching 7.7; the budget line reports declared vs
+computed; a failed precondition writes `precondition_failed` and exit 1. The `FakeClient`
+keeps U4's `wait` contract (device lines only; a declared `window` holds a matched wait to
+`start + window`), so a test cannot pass on behaviour the daemon does not have.
 
 **U8 Device profile (outside the repo)** — writes a real device's
 `~/.config/benchctl/profiles/<name>/profile.toml` and its acceptance scenarios, plus
@@ -1191,11 +1325,18 @@ and every scenario, and nothing device-specific (hostnames, credentials) lands i
 ## 9. Bench validation (hardware)
 
 - Attach resets exactly once; `status` shows the POWERON reset and the identity; a second
-  `cmd` does not reset.
+  `cmd` does not reset. Exactly one `reset` event before the first `cmd`, `expected: true,
+  cause: "attach"`; a second one (`expected: false`) means the open-reset's `rst:` line beat
+  the pulse (Section 4.5) and attach must stop consuming the arm for lines stored before the
+  pulse returned.
 - `cmd version` after attach is sent only after the gate (no vanished command, no 1.2–2.0 s
   config-window reboot); confirm with `log --since attach`.
 - `flash build/debug --only app,otadata` at 921600 completes, the after-reset is classified
   expected, and the boot's `ELF file SHA256` prefix matches the recorded `app_elf_sha256`.
+  No other `reset` event appears between `## flash begin` and the armed one, and the
+  `flash_log` event count for a ~2 MB write is tolerable.
+- `flash --after no-reset` leaves `status` in `bootloader` with no probe TX, and `cmd` is
+  refused until `reset`.
 - Identity mismatch (`expect.mac` wrong on purpose) fails attach with exit 4.
 - `serial.log` of a debug build contains `sip_pass=***` and never the password.
 - Two units (both FTDI channels, or a second adapter) driven from two shells concurrently
