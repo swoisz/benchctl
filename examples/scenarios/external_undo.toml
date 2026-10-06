@@ -1,0 +1,29 @@
+# A host-side step whose undo runs at the end of the scenario (also on failure or Ctrl-C),
+# and a step the operator performs while the runner watches the log for proof.
+name = "external step with undo"
+budget = "6m"
+
+[[step]]
+name = "create a marker file"
+kind = "external"
+run = "touch benchctl-example.marker"
+undo = "rm -f benchctl-example.marker"
+cwd = "."
+env = { BENCHCTL_EXAMPLE = "1" }
+timeout = "10s"
+
+[[step]]
+name = "operator resets the unit"
+kind = "human"
+prompt = "Press the unit's RESET button."
+confirm = 'rst:0x[0-9a-fA-F]+'
+expect_reset = true
+timeout = "5m"
+
+[[step]]
+name = "shell answers after the reset"
+kind = "cmd"
+at = "+1s"                         # one second after the confirm line
+send = "version"
+expect = 'Version:?\s*\S+'
+timeout = "8s"

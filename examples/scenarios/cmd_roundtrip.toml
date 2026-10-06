@@ -1,0 +1,28 @@
+# Send a command by line and through the profile's command map, then find the replies in the
+# log from a mark.
+name = "command round trip"
+budget = "1m"
+
+[[step]]
+kind = "mark"
+name = "before_version"
+
+[[step]]
+name = "version by line"
+kind = "cmd"
+send = "version"
+expect = 'Version:?\s*\S+'
+error = ["command not found", "ERROR"]
+timeout = "8s"
+
+[[step]]
+name = "version from the command map"
+kind = "cmd"
+command = "version"
+
+[[step]]
+name = "echo precedes the reply"
+kind = "wait"
+order = ['version$', 'Version:?\s*\S+']
+since = "before_version"
+timeout = "5s"

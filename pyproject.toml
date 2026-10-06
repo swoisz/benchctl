@@ -49,12 +49,6 @@ mypy_path = "src"
 module = "esptool.*"
 ignore_missing_imports = true
 
-# Wave-1 modules (U3) that the scaffold's stubs and fixtures name only under TYPE_CHECKING
-# or lazily. Inert once those files exist; lets the scaffold type-check on its own.
-[[tool.mypy.overrides]]
-module = ["benchctl.profile", "benchctl.scenario"]
-ignore_missing_imports = true
-
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["tests"]

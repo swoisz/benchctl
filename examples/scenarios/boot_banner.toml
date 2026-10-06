@@ -1,0 +1,22 @@
+# Reset the unit, see the app start, and check it does not reset a second time.
+name = "boot banner"
+budget = "1m"
+
+[[step]]
+name = "reset the unit"
+kind = "reset"
+
+[[step]]
+name = "app starts"
+kind = "wait"
+pattern = 'App version:\s*\S+'
+since = "prev"                     # from the start of the reset step, so the boot is covered
+timeout = "20s"
+
+[[step]]
+name = "no second reset"
+kind = "wait"
+absent = "rst:"
+since = "trigger"                  # from the app-start line just matched
+window = "5s"
+timeout = "5s"
