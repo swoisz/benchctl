@@ -543,7 +543,9 @@ class _Run:
         started = datetime.now()
         status = self.client.status()
         self.unit = status.unit
-        self._learn(status.identity)
+        # `status` is read-only, so on a run that attached it carries no identity yet: probe
+        # here, before the first record, rather than lazily inside the first `mark`.
+        self._learn(self.client.identity())
         self.first = self.prev_start = self.client.mark(None)
         self.clock = _DeviceClock(_attach_epoch(status.attached_at))
         writer = EventWriter(

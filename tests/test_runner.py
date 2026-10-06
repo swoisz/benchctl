@@ -56,7 +56,11 @@ class FakeClient:
     marks, scripted replies, resets with arming, and a tail feed of lines and events."""
 
     def __init__(
-        self, *, identity: Identity | None = None, gate: dict[str, Any] | None = None
+        self,
+        *,
+        identity: Identity | None = None,
+        gate: dict[str, Any] | None = None,
+        lazy_identity: bool = False,
     ) -> None:
         self._cond = threading.Condition()
         self._t0 = time.monotonic()
@@ -75,6 +79,9 @@ class FakeClient:
         self.on_wait: Callable[[dict[str, Any]], None] | None = None
         self.on_cmd: Callable[[str], CmdResult | None] | None = None
         self.raise_in: dict[str, BaseException] = {}  # op -> raised once, when called
+        # As the daemon after an auto-attach: identity is probed on the first identity, mark
+        # or cmd op, and until then `status` and the events carry none.
+        self.probed = not lazy_identity
         self.line("## attach unit=u1 port=/dev/fake baud=115200", meta=True)
 
     # --- the simulated device --------------------------------------------------------
@@ -111,8 +118,8 @@ class FakeClient:
                 "ts": datetime.now().astimezone().isoformat(timespec="milliseconds"),
                 "t": round(self.now(), 3),
                 "unit": "u1",
-                "fw": FW,
-                "dev": MAC,
+                "fw": FW if self.probed else None,
+                "dev": MAC if self.probed else None,
                 "type": kind,
                 "offset": offset,
                 **fields,
@@ -169,6 +176,8 @@ class FakeClient:
 
     def _call(self, op: str, **args: Any) -> None:
         self.calls.append((op, time.monotonic(), args))
+        if op in ("identity", "mark", "cmd"):
+            self.probed = True
         if op in self.raise_in:
             raise self.raise_in.pop(op)
 
@@ -199,7 +208,7 @@ class FakeClient:
             connected=True,
             baud=115200,
             lease={},
-            identity=self.identity_result,
+            identity=self.identity_result if self.probed else None,
             last_reset=None,
             offset=len(self.lines),
             gate=GateState("ready", 0.0, "pattern"),
@@ -940,6 +949,21 @@ command = "restart"
 kind = "mark"
 name = "done"
 """
+
+
+def test_run_that_attaches_learns_fw_before_its_first_record(
+    tmp_path: Path, profile: Profile
+) -> None:
+    fake = FakeClient(lazy_identity=True)
+    body = '[[step]]\nkind = "mark"\nname = "m"\n'
+    result, _ = run(fake, scenario(tmp_path, body), profile, tmp_path)
+    assert result.result == "pass", result.steps
+    header = (result.run_dir / "results.md").read_text(encoding="utf-8").splitlines()[0]
+    assert f"fw {FW}" in header
+    events = events_of(result)
+    assert events
+    assert all((event["fw"], event["dev"]) == (FW, MAC) for event in events), events
+    assert [op for op, *_ in fake.calls][:3] == ["status", "identity", "mark"]
 
 
 def test_run_dir_holds_the_six_files_and_results_md_follows_7_7(

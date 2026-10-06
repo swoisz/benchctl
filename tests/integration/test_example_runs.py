@@ -197,13 +197,6 @@ def test_run_external_undo_runs_the_undo(bench: Bench) -> None:
     assert resets.startswith("Resets: 1 expected (step 2), 0 unexpected.")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="_Run.run learns fw from a read-only `status` before its first mutating op; on a "
-    "run that auto-attaches, Daemon._handle probes identity only for that op (the runner's "
-    "`mark(None)`) and the runner never reads it again, so results.md says `fw unknown` and "
-    "the runner's own records carry fw null",
-)
 def test_run_that_attaches_names_the_fw(bench: Bench) -> None:
     device = bench.add_unit(UNIT)
     run = run_example(bench, device, "cmd_roundtrip")  # no attach first: the run attaches
