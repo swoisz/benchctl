@@ -337,11 +337,17 @@ Port of hail's `RxBuf`/`take_line`/`strip_ansi`/`classify`:
   across reads is held back, invalid bytes become U+FFFD.
 - Line terminators: `\n`, `\r\n`, bare `\r`. A lone trailing `\r` is held back until the
   next byte decides whether it is `\r\n`. Lines are ANSI-stripped (CSI `ESC [ … <0x40–0x7E>`,
-  non-letter finals included) and returned without their terminator.
-- `LineEngine.tail -> str`: decoded, ANSI-stripped text after the last terminator. The
+  non-letter finals included; an unterminated CSI runs to the end of the line, as in hail)
+  and returned without their terminator. `take_line(buf) -> (line, rest) | None` is the
+  pure split underneath.
+- `LineEngine.tail -> str`: decoded, ANSI-stripped text after the last terminator; `""`
+  while a lone `\r` is held, and never includes a held-back partial multibyte char. The
   prompt `demo> ` is **unterminated**; it only ever exists in the tail until the next
   echo completes the line (`demo> version`). Three things match against the tail, not
-  lines: capture-until-prompt, the gate's prompt detection, and the prompt probe.
+  lines: capture-until-prompt, the gate's prompt detection, and the prompt probe. There is
+  no consuming `read_until`: a marker stays in the tail (hail's test keeps its name and
+  asserts this).
+- `LineEngine` is per reader: make a fresh one after a reconnect or a flash.
 - `classify(line, success: list[str], error: list[str]) -> "success"|"error"|"skip"`:
   trimmed line; empty → skip; error if the line **contains** any error marker; success if
   it **starts with** a non-empty success marker (hail semantics). benchctl's `cmd --expect`
@@ -353,15 +359,26 @@ Port of hail's `RxBuf`/`take_line`/`strip_ansi`/`classify`:
 - `parse_idf_line(text) -> IdfLine|None`: `^([IWEDV]) \((\d+)\) ([^:]+): (.*)$` → level,
   device_ms, tag, msg. Device ms stays in the stored text; it is parsed for reboot
   inference only.
-- Reset line: default pattern `rst:0x(?P<code>[0-9a-fA-F]+) \((?P<reason>[A-Z_0-9]+)\)(?:,boot:0x[0-9a-fA-F]+ \((?P<boot>[A-Z_0-9]+)\))?`.
-  Profile `boot.reset_patterns` may add more (each must define `reason`, may define `code`,
-  `boot`).
+- Reset line: default pattern `rst:0x(?P<code>[0-9a-fA-F]+) \((?P<reason>[A-Z_0-9]+)\)(?:,boot:0x[0-9a-fA-F]+ \((?P<boot>[A-Z_0-9]+))?`.
+  The `boot` group has no closing `\)`: download mode nests parentheses
+  (`boot:0x0 (DOWNLOAD(USB/UART0))`) and yields `boot = "DOWNLOAD"`. Profile
+  `boot.reset_patterns` are tried after it (each must define `reason`, may define `code`,
+  `boot`). An optional `reason` that did not participate reads `"unknown"`; `code` is parsed
+  as hex with or without `0x`, `null` when it is not hex.
 - ELF SHA line: default `ELF file SHA256:\s*(?P<sha>[0-9a-fA-F]+)`. The device prints a
-  prefix (IDF's `CONFIG_APP_RETRIEVE_LEN_ELF_SHA`); matching against a flashed image's
-  `app_elf_sha256` is a prefix match.
+  prefix (IDF's `CONFIG_APP_RETRIEVE_LEN_ELF_SHA`); `sha_matches(device_sha, app_elf_sha256)`
+  is a case-insensitive prefix match, false for an empty device sha.
 - Reboot inference: an IDF line whose device_ms is lower than the previous one by more than
   `boot.ms_regression` (default 1000) with no reset line in between → synthetic reset
-  `reason: "unknown"`, `code: null`.
+  `reason: "unknown"`, `code: null`, `inferred: true`. Any matched reset line (default or
+  profile pattern, IDF-shaped or not) clears the baseline; the next IDF line starts it.
+- API: `IdfDetector(reset_patterns, sha_pattern, ms_regression).feed(text) -> Detection |
+  None`, with `Detection = (reset: ResetMatch | None, elf_sha: str | None)` and
+  `ResetMatch = (code, reason, boot_mode, inferred)`. One line can carry both (a missed
+  reset surfacing on the SHA line). U4 builds `types.ResetInfo` from a `ResetMatch` plus
+  offset, time, arming and context. `compile_reset_patterns`/`compile_sha_pattern` raise
+  `UsageError` and are what U3 validates with. The detector is fed **device lines only**,
+  never `## ` meta lines, and is per reader like `LineEngine`.
 
 ### 4.5 Reset classification
 
@@ -427,13 +444,18 @@ booting for > boot.ready_timeout, or unknown  → probe: send boot.probe + line_
 ### 4.8 Redaction (`redact.py`)
 
 - `Redactor(patterns).apply(text) -> text`. Each profile pattern is a regex compiled with
-  `re.IGNORECASE` off. If it has exactly one capturing group, the group is kept and the
-  rest of the match becomes `***`; with no group the whole match becomes `***`. More than
-  one group is a profile validation error.
+  `re.IGNORECASE` off, applied in profile order to every occurrence. With exactly one
+  capturing group the match becomes the group's text followed by `***`, wherever the group
+  sat (`(sip_pass=)\S+` → `sip_pass=***`; write prefix groups: a suffix group gives
+  `domain***`, not `***domain`). With no group, or a group that did not participate, the
+  whole match becomes `***`. More than one capturing group is a profile validation error
+  (`Redactor()` raises `UsageError`; U3 validates with it).
+- A match whose masked part is empty or already only `*` is left unchanged, so a second
+  `apply` over its own output is a no-op for ordinary patterns; the tail (redacted before
+  prompt matching) and stored lines can both pass through it.
 - Applied in exactly one place: the reader, to every line before it reaches LogStore, and
   to every meta line text before it is appended. Replies, captures, waits, `log`, `tail`,
-  events, and `results.md` are all derived from stored lines, so they inherit it. The tail
-  used for prompt matching is redacted too (`Redactor.apply` is idempotent).
+  events, and `results.md` are all derived from stored lines, so they inherit it.
 - `cmd --secret` replaces the TX meta text with `<redacted>` regardless of patterns
   (`wifi set <ssid> <pass>`).
 
