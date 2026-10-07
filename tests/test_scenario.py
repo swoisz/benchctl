@@ -192,6 +192,8 @@ name = "m1"
         ("[[step]]\nkind = 'cmd'\n", "step[1]: needs exactly one of send and command"),
         ("[[step]]\nkind = 'cmd'\nsend = 'a'\ncommand = 'b'\n", "step[1]: needs exactly one"),
         ("[[step]]\nkind = 'cmd'\nsend = 'a'\nargs = { k = 'v' }\n", "step[1].args: only applies"),
+        ("[[step]]\nkind = 'cmd'\nsend = 'a'\nsecret = 'yes'\n", "step[1].secret: expected true"),
+        ("[[step]]\nkind = 'reset'\nsecret = true\n", "step[1].secret: unknown key"),
         (
             "[[step]]\nkind = 'cmd'\nsend = 'a'\ncapture = true\nexpect = 'OK'\n",
             "step[1]: capture and expect are exclusive",
@@ -240,6 +242,23 @@ def test_rule_violation_is_path_qualified(tmp_path: Path, text: str, error: str)
         load_scenario(path)
     found = raised.value.errors
     assert any(line.startswith(f"{path}: {error}") for line in found), found
+
+
+def test_cmd_secret_loads(tmp_path: Path) -> None:
+    secret, plain = steps_of(
+        tmp_path,
+        "[[step]]\nkind = 'cmd'\nsend = 'wifi set {ssid} {pass}'\nsecret = true\n"
+        "[[step]]\nkind = 'cmd'\nsend = 'version'\n",
+    )
+    assert (secret.secret, plain.secret) == (True, False)
+
+
+@pytest.mark.parametrize("text", [NAMED, NAMED + "step = []\n"])
+def test_a_scenario_needs_at_least_one_step(tmp_path: Path, text: str) -> None:
+    path = write(tmp_path / "s.toml", text)
+    [row] = validate_paths([path])
+    assert (row["kind"], row["ok"]) == ("scenario", False)
+    assert row["errors"] == [f"{path}: step: needs at least one step"]
 
 
 def test_name_is_required(tmp_path: Path) -> None:
@@ -309,7 +328,7 @@ def test_validate_a_profile_dir_with_scenarios(tmp_path: Path) -> None:
     write(tmp_path / "demo" / "profile.toml", '[profile]\nname = "demo"\n')
     write(tmp_path / "demo" / "scenarios" / "b.toml", NAMED + "[[step]]\nkind = 'reset'\n")
     write(tmp_path / "demo" / "scenarios" / "a.toml", "[[step]]\nkind = 'reset'\n")
-    write(tmp_path / "loose" / "one.toml", NAMED)
+    write(tmp_path / "loose" / "one.toml", NAMED + "[[step]]\nkind = 'reset'\n")
     (tmp_path / "empty").mkdir()
 
     rows = validate_paths([tmp_path / "demo", tmp_path / "loose", tmp_path / "empty"])

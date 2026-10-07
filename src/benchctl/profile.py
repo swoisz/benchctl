@@ -187,16 +187,15 @@ class Table:
         value = self.opt_seconds(key, positive=positive)
         return default if value is None else value
 
-    def integer(self, key: str, default: int) -> int:
-        """A positive integer."""
+    def integer(self, key: str, default: int, *, positive: bool = True) -> int:
         value = self.data.get(key)
         if value is None:
             return default
         if isinstance(value, bool) or not isinstance(value, int):
             self._wrong(key, "an integer")
             return default
-        if value <= 0:
-            self.error(key, "must be greater than 0")
+        if value < 0 or (positive and value == 0):
+            self.error(key, "must be greater than 0" if positive else "must not be negative")
             return default
         return value
 
@@ -424,8 +423,11 @@ class Command:
 
     @property
     def expect_regex(self) -> str | None:
-        """`expect` as the regex `Session.cmd` takes, keeping hail's starts-with semantics."""
-        return None if self.expect is None else r"^\s*" + re.escape(self.expect)
+        """`expect` as the regex `Session.cmd` takes, keeping hail's starts-with semantics; an
+        empty marker never matches, as in hail."""
+        if self.expect is None:
+            return None
+        return r"^\s*" + re.escape(self.expect) if self.expect else "(?!)"
 
     @property
     def error_regexes(self) -> list[str]:
@@ -541,7 +543,7 @@ def _boot(root: Table, prompt: str | None) -> BootConfig:
         reset_patterns=reset_patterns,
         sha_pattern=sha_pattern,
         expected_reset_window=t.seconds("expected_reset_window", d.expected_reset_window),
-        ms_regression=t.integer("ms_regression", d.ms_regression),
+        ms_regression=t.integer("ms_regression", d.ms_regression, positive=False),
     )
 
 

@@ -39,7 +39,7 @@ _COMMON_KEYS = ("name", "kind", "at", "timeout", "unit", "expect_reset", "contin
 _KIND_KEYS: dict[str, tuple[str, ...]] = {
     "human": ("prompt", "confirm", "trigger"),
     "external": ("run", "undo", "cwd", "env"),
-    "cmd": ("send", "command", "args", "expect", "error", "capture"),
+    "cmd": ("send", "command", "args", "expect", "error", "capture", "secret"),
     "wait": ("pattern", "since", "absent", "window", "order", "trigger"),
     "reset": ("bootloader",),
     "flash": ("artifacts", "files", "only", "after"),
@@ -84,6 +84,7 @@ class Step:
     expect: str | None = None
     error: list[str] = field(default_factory=list)
     capture: bool | None = None
+    secret: bool = False
     # wait
     pattern: str | None = None
     since: str = "prev"
@@ -236,6 +237,7 @@ def _cmd(t: Table, base: Step) -> Step:
         expect=_pattern(t, "expect"),
         error=[regex.pattern for regex in t.regex_list("error")],
         capture=t.opt_flag("capture"),
+        secret=t.flag("secret", False),
     )
 
 
@@ -333,6 +335,8 @@ def build_scenario(data: Mapping[str, Any], path: Path) -> Scenario:
     pre = root.table("preconditions", _PRECONDITION_KEYS)
     marks: set[str] = set()
     steps: list[Step] = []
+    if root.data.get("step") in (None, []):
+        root.error("step", "needs at least one step")
     for index, raw in enumerate(root.tables("step", None), 1):
         kind = raw.data.get("kind")
         if kind is None:

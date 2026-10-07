@@ -225,6 +225,7 @@ def test_hail_command_map_loads_unchanged(tmp_path: Path) -> None:
         ),
         ('[boot]\nready = "["\n', "boot.ready: invalid regex"),
         ("[boot]\nms_regression = 1000.0\n", "boot.ms_regression: expected an integer"),
+        ("[boot]\nms_regression = -1\n", "boot.ms_regression: must not be negative"),
         ('[commands.v]\nsend = "v"\nerror = ["ERR", ""]\n', "commands.v.error[2]: must not be"),
         ('[boot]\nsettle = "2.5s"\n', "boot.settle: expected seconds as a number, got a string"),
         ("[console]\ntimeout = true\n", "console.timeout: expected seconds as a number"),
@@ -390,6 +391,33 @@ def test_command_lookup_and_deny_list(tmp_path: Path) -> None:
     assert raised.value.exit_code == 2
 
 
+def first_outcome(command: Command, lines: list[str]) -> tuple[str, str] | None:
+    """hail's `expect` loop over the converted regexes: an error marker anywhere wins, a
+    success marker must start the line, anything else is noise."""
+    for line in lines:
+        if any(re.search(regex, line) for regex in command.error_regexes):
+            return "error", line.strip()
+        if command.expect_regex is not None and re.search(command.expect_regex, line):
+            return "success", line.strip()
+    return None
+
+
+def test_expect_returns_success_and_skips_noise() -> None:
+    command = Command(name="c", send="c", expect="CLEARED", error=["ERROR"])
+    lines = ["boot banner", "stray line", "CLEARED ok", "> "]
+    assert first_outcome(command, lines) == ("success", "CLEARED ok")
+
+
+def test_expect_errors_on_error_marker() -> None:
+    command = Command(name="c", send="c", expect="CLEARED", error=["ERROR"])
+    assert first_outcome(command, ["ERROR: bad arg"]) == ("error", "ERROR: bad arg")
+
+
+def test_empty_success_marker_never_matches() -> None:
+    command = Command(name="c", send="c", expect="", error=["ERROR"])
+    assert first_outcome(command, ["noise", "", "  "]) is None
+
+
 def test_command_markers_convert_to_regexes_with_hail_semantics() -> None:
     command = Command(name="t", send="t", expect="OK.", error=["FAIL(", "E*"])
     assert command.expect_regex is not None
@@ -399,6 +427,11 @@ def test_command_markers_convert_to_regexes_with_hail_semantics() -> None:
     assert command.error_regexes == [re.escape("FAIL("), re.escape("E*")]
     assert re.search(command.error_regexes[0], "self-test FAIL(3)") is not None
     assert Command(name="c", send="c", capture=True).expect_regex is None
+
+
+def test_ms_regression_zero_turns_inference_off(tmp_path: Path) -> None:
+    profile = parse_profile(MINIMAL + "[boot]\nms_regression = 0\n", tmp_path / "profile.toml")
+    assert profile.boot.ms_regression == 0
 
 
 def test_flash_overrides_use_hyphen_names(tmp_path: Path) -> None:
