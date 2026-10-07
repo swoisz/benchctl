@@ -41,7 +41,8 @@ class ResetMatch:
 
 @dataclass(frozen=True, slots=True)
 class Detection:
-    """What one stored line revealed. A missed reset can surface on the SHA line itself."""
+    """What one stored line revealed. A missed reset can surface on the SHA line itself; the
+    session keeps the first SHA seen for each reset."""
 
     reset: ResetMatch | None
     elf_sha: str | None
@@ -76,12 +77,6 @@ def compile_sha_pattern(pattern: str = DEFAULT_SHA_PATTERN) -> re.Pattern[str]:
     return _compile(pattern, "sha", "sha pattern")
 
 
-def sha_matches(device_sha: str, app_elf_sha256: str) -> bool:
-    """Case-insensitive prefix match: the device prints only the first
-    CONFIG_APP_RETRIEVE_LEN_ELF_SHA hex digits of the image's SHA."""
-    return bool(device_sha) and app_elf_sha256.lower().startswith(device_sha.lower())
-
-
 def _parse_code(text: str | None) -> int | None:
     if text is None:
         return None
@@ -114,6 +109,8 @@ class IdfDetector:
             reset is None
             and ms is not None
             and self._last_ms is not None
+            # 0 turns inference off, for firmware whose buffered logs replay older timestamps.
+            and self._ms_regression > 0
             and self._last_ms - ms > self._ms_regression
         ):
             reset = ResetMatch(None, UNKNOWN_REASON, None, inferred=True)

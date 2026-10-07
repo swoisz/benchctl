@@ -14,7 +14,6 @@ from benchctl.idf import (
     compile_reset_patterns,
     compile_sha_pattern,
     parse_idf_line,
-    sha_matches,
 )
 from benchctl.linebuf import LineEngine
 from fakedev import DEFAULT_BOOT, ELF_SHA_PREFIX, RST_DOWNLOAD, RST_POWERON, RST_SW
@@ -126,14 +125,6 @@ def test_sha_pattern_needs_sha_group_and_must_compile(pattern: str) -> None:
         compile_sha_pattern(pattern)
 
 
-def test_sha_matches_is_a_case_insensitive_prefix_match() -> None:
-    full = ELF_SHA_PREFIX + "f" * 48
-    assert sha_matches(ELF_SHA_PREFIX, full)
-    assert sha_matches(ELF_SHA_PREFIX.upper(), full)
-    assert not sha_matches("ffff", full)
-    assert not sha_matches("", full)
-
-
 def test_ms_regression_infers_a_reset_only_beyond_the_threshold() -> None:
     inferred = Detection(ResetMatch(None, "unknown", None, inferred=True), None)
 
@@ -153,6 +144,12 @@ def test_ms_regression_threshold_is_configurable() -> None:
     assert detection is not None
     assert detection.reset is not None
     assert detection.reset.inferred
+
+
+def test_ms_regression_zero_disables_inference() -> None:
+    detector = IdfDetector(ms_regression=0)
+    assert detector.feed(_idf(5000)) is None
+    assert detector.feed(_idf(10)) is None
 
 
 def test_reset_line_clears_the_ms_baseline() -> None:

@@ -456,6 +456,19 @@ def test_wait_since_a_mark_matches_and_absent_passes_and_fails(
     assert clean.result == "match"
 
 
+def test_a_line_matching_pattern_and_absent_violates(ready_session: DeviceSession) -> None:
+    both = ready_session.wait(
+        r"console: shell started",
+        ready_session.resolve("boot"),
+        1.0,
+        absent="shell started",
+        window=None,
+        order=None,
+        progress=None,
+    )
+    assert (both.result, both.line) == ("absent_violated", "I (1150) console: shell started")
+
+
 def test_wait_order_and_meta_lines_never_match(ready_session: DeviceSession) -> None:
     mark = ready_session.mark("m")
     cmd(ready_session, "version")
@@ -500,7 +513,7 @@ def test_window_without_absent_does_not_hold_the_match(ready_session: DeviceSess
 def test_wait_reports_progress_and_times_out(
     ready_session: DeviceSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr("benchctl.session.PROGRESS_INTERVAL", 0.05)
+    monkeypatch.setattr("benchctl.session.PROGRESS_S", 0.05)
     beats: list[dict[str, Any]] = []
     result = ready_session.wait(
         "never printed", 0, 0.2, absent=None, window=None, order=None, progress=beats.append
@@ -535,6 +548,66 @@ def test_vanish_then_reappear_reconnects_on_the_new_path(
     assert gates == [("unknown", None), ("settling", "probe"), ("ready", "probe")]
 
     assert cmd(ready_session, "version").captured == VERSION_REPLY
+
+
+def test_a_boot_after_port_back_is_an_expected_reset(
+    ready_session: DeviceSession, fakedev: FakeDevice
+) -> None:
+    # Native USB, or an adapter that resets on open: the unit boots as the port comes back.
+    fakedev.vanish()
+    until(lambda: not ready_session.status().connected)
+    fakedev.reappear()
+    until(lambda: ready_session.status().connected)
+    fakedev.reset()
+    [back] = events(ready_session, "port_back")
+    until(lambda: any(e["offset"] > back["offset"] for e in events(ready_session, "reset")))
+    [reset] = [e for e in events(ready_session, "reset") if e["offset"] > back["offset"]]
+    assert (reset["expected"], reset["cause"]) == (True, "port_back")
+
+
+def test_reconnect_failures_are_noted_once_per_distinct_message(
+    ready_session: DeviceSession,
+    fakedev: FakeDevice,
+    ports_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("benchctl.session.RECONNECT_INTERVAL", 0.02)
+    serial = fakedev.serial_number
+
+    def failures() -> list[str]:
+        return [t for t in texts(ready_session) if t.startswith("## reconnect failed ")]
+
+    def ambiguous() -> None:
+        twins = [
+            {"device": f"/dev/benchctl-twin-{n}", "vid": None, "pid": None, "serial_number": serial}
+            for n in (1, 2)
+        ]
+        ports_file.write_text(json.dumps(twins), encoding="utf-8")
+
+    unplugged = f"## reconnect failed no port matches serial={serial} (present: none)"
+    twins_prefix = f"## reconnect failed 2 ports match serial={serial}: "
+
+    def noted_both(since: int) -> bool:
+        later = failures()[since:]
+        return unplugged in later and any(t.startswith(twins_prefix) for t in later)
+
+    # The first attempt may still see the old path listed (`cannot open …`): another message.
+    fakedev.vanish()
+    until(lambda: unplugged in failures())
+    ambiguous()
+    until(lambda: noted_both(0))
+    time.sleep(0.2)  # ten more attempts on messages already noted
+    first = failures()
+    assert len(first) == len(set(first))
+
+    fakedev.reappear()
+    until(lambda: len(events(ready_session, "port_back")) == 1)
+    fakedev.vanish()
+    until(lambda: unplugged in failures()[len(first) :])
+    ambiguous()
+    until(lambda: noted_both(len(first)))
+    again = failures()[len(first) :]
+    assert len(again) == len(set(again)), "noted again, once, after a successful reopen"
 
 
 def test_pause_reader_parks_and_a_port_closed_underneath_recovers(
@@ -657,6 +730,29 @@ def test_gate_check_requires_and_forbids_and_passes_without_an_env_gate(
     assert session.gate_check(0, 0.1) == {"ok": True, "missing": [], "forbidden_hits": []}
     session.profile = dataclasses.replace(profile, env_gate=None)
     assert session.gate_check(0, 0.1) == {"ok": True, "missing": [], "forbidden_hits": []}
+
+
+def test_forbid_only_gate_watches_its_whole_timeout(
+    make_fakedev: FakeDeviceFactory, make_session: SessionFactory, profile: Profile
+) -> None:
+    device = make_fakedev(DeviceScript(slow_s=10.0))  # `slow` answers 0.5 s later
+    session = make_session(
+        device, with_profile=dataclasses.replace(profile, env_gate=EnvGate(forbid=["slow: done"]))
+    )
+    until(lambda: ready(session))
+    since = session.mark(None)
+    cmd(session, "slow", capture=False)
+    started = time.monotonic()
+    caught = session.gate_check(since, 3.0)
+    assert caught["ok"] is False
+    [hit] = caught["forbidden_hits"]
+    assert hit["line"] == "slow: done"
+    assert time.monotonic() - started < 2.0
+
+    since = session.mark(None)
+    started = time.monotonic()
+    assert session.gate_check(since, 0.3) == {"ok": True, "missing": [], "forbidden_hits": []}
+    assert time.monotonic() - started >= 0.3
 
 
 def test_log_marks_and_cursor_rules(ready_session: DeviceSession) -> None:

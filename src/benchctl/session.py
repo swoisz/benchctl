@@ -24,11 +24,11 @@ import subprocess
 import threading
 import time
 from collections.abc import Callable, Iterator
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
 
 from benchctl import paths, registry
+from benchctl.defaults import PROGRESS_S, REDACTED, RESET_WAIT_S, iso_now
 from benchctl.errors import (
     BenchctlError,
     DeviceError,
@@ -70,14 +70,13 @@ RECONNECT_SLOW_INTERVAL = 5.0
 RECONNECT_TIMEOUT = 120.0  # after this long unplugged, retry at the slow interval
 PAUSE_ACK_TIMEOUT = 2.0
 FSYNC_INTERVAL = 1.0
-PROGRESS_INTERVAL = 5.0
 JOIN_TIMEOUT = 2.0
 MIN_WAKE = 0.005
 READER_ERROR_BACKOFF = 0.1
-REDACTED = "<redacted>"
 FW_FIELD = "fw_version"
 DEFAULT_ID_FIELDS = ("mac", "cert_cn")
 ATTACH_CAUSE = "attach"
+PORT_BACK_CAUSE = "port_back"
 _STAMPED = frozenset({"seq", "ts", "t", "unit", "fw", "dev"})
 _MS_DIGITS = 3
 
@@ -88,10 +87,6 @@ CmdMode = Literal["none", "expect", "capture"]
 class _Arming:
     cause: str
     until: float  # seconds since attach
-
-
-def _iso_now() -> str:
-    return datetime.now().astimezone().isoformat(timespec="milliseconds")
 
 
 def _compile(pattern: str, what: str) -> re.Pattern[str]:
@@ -166,7 +161,7 @@ class DeviceSession:
         except BaseException:
             transport.close()
             raise
-        self.attached_at = _iso_now()
+        self.attached_at = iso_now()
         self._cond = self._store.cond
         self._events_closed = False
         self._seq = 0
@@ -191,6 +186,7 @@ class DeviceSession:
         self._lost_at = 0.0
         self._lost_count = 0
         self._next_attempt = 0.0
+        self._reconnect_failures: set[str] = set()  # messages already noted since the loss
         self._closing = threading.Event()
         self._kick = threading.Event()  # wakes housekeeping on a gate change
         self._pause_req = threading.Event()
@@ -239,7 +235,7 @@ class DeviceSession:
             fields = {} if identity is None else identity.fields
             record: Event = {
                 "seq": self._seq,
-                "ts": _iso_now(),
+                "ts": iso_now(),
                 "t": round(self._store.now(), _MS_DIGITS),
                 "unit": self.unit,
                 "fw": fields.get(FW_FIELD),
@@ -423,11 +419,20 @@ class DeviceSession:
             path = registry.match_port(self._match, registry.list_ports())
             transport = PySerialTransport.open(path, self._baud, self._lines)
         except (BenchctlError, OSError) as exc:
-            log.debug("reconnect: %s", exc)
+            # Unplugged repeats one message every 0.5 s; a new one (two ports now match, the
+            # unit came back with another VID) is what the operator needs to see.
+            message = str(exc)
+            if message not in self._reconnect_failures:
+                self._reconnect_failures.add(message)
+                self._note(f"reconnect failed {message}")
+                log.warning("reconnect failed: %s", message)
             return
+        self._reconnect_failures.clear()
         with self._cond:
             self._engine = LineEngine()
             self._detector = self._new_detector()
+            # On the bench adapter the open itself resets the unit (Section 4.9).
+            self._arm(PORT_BACK_CAUSE)
             self._transport = transport
             self._path = path
             gap = self._store.now() - self._lost_at
@@ -757,7 +762,7 @@ class DeviceSession:
     # --- reset -----------------------------------------------------------------------------
 
     def reset(
-        self, bootloader: bool, wait_rst: float = 5.0, *, cause: str = "reset"
+        self, bootloader: bool, wait_rst: float = RESET_WAIT_S, *, cause: str = "reset"
     ) -> ResetInfo | None:
         """Reset through the modem lines; the reset line seen within `wait_rst`, else None."""
         with self._device:
@@ -822,7 +827,7 @@ class DeviceSession:
         last_match: re.Match[str] | None = None
         early: dict[int, LogLine] = {}
         pos = since
-        next_progress = start + PROGRESS_INTERVAL
+        next_progress = start + PROGRESS_S
 
         def result(
             kind: Literal[
@@ -847,6 +852,13 @@ class DeviceSession:
                     pos = line.offset + 1
                     if line.meta:
                         continue
+                    # Absence first: a line matching both the pattern and `absent` violates.
+                    watching = len(matched) < len(sequence) or (
+                        watch_until is not None and line.t <= watch_until
+                    )
+                    hit = None if absent_re is None or not watching else absent_re.search(line.text)
+                    if hit is not None:
+                        return result("absent_violated", line, _groups(hit))
                     if len(matched) < len(sequence):
                         match = sequence[len(matched)].search(line.text)
                         if match is not None:
@@ -856,13 +868,6 @@ class DeviceSession:
                         for later in range(len(matched) + 1, len(sequence)):
                             if later not in early and sequence[later].search(line.text):
                                 early[later] = line
-                    if absent_re is not None:
-                        hit = absent_re.search(line.text)
-                        watching = len(matched) < len(sequence) or (
-                            watch_until is not None and line.t <= watch_until
-                        )
-                        if hit is not None and watching:
-                            return result("absent_violated", line, _groups(hit))
                 now = time.monotonic()
                 complete = len(matched) == len(sequence)
                 if complete and (watch_until is None or self._store.now() >= watch_until):
@@ -891,7 +896,7 @@ class DeviceSession:
                         "note": f"waiting since {since}",
                     }
                 )
-                next_progress += PROGRESS_INTERVAL
+                next_progress += PROGRESS_S
 
     # --- identity and the env gate ---------------------------------------------------------
 
@@ -999,7 +1004,8 @@ class DeviceSession:
                         if regex.search(line.text)
                     )
                 remaining = deadline - time.monotonic()
-                if hits or len(found) == len(require) or remaining <= 0:
+                # A forbid-only gate watches its whole timeout; nothing else ends it early.
+                if hits or (require and len(found) == len(require)) or remaining <= 0:
                     break
                 self._cond.wait(remaining)
         missing = [regex.pattern for i, regex in enumerate(require) if i not in found]
@@ -1020,7 +1026,7 @@ class DeviceSession:
             self._pause_req.set()
             try:
                 if not self._parked.wait(PAUSE_ACK_TIMEOUT):
-                    raise InternalError("the reader did not park within 2 s")
+                    raise InternalError(f"the reader did not park within {PAUSE_ACK_TIMEOUT:g} s")
                 yield transport
             finally:
                 # The reader is parked, so its per-reader state can be swapped safely.
