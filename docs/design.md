@@ -365,8 +365,9 @@ Port of hail's `RxBuf`/`take_line`/`strip_ansi`:
 - `LineEngine` is per reader: make a fresh one after a reconnect or a flash.
 - hail's `classify` (success marker **starts** the trimmed line, error marker is
   **contained**) is not ported as a function: `cmd --expect`/`--error` are regexes, and the
-  map's `expect` string is compiled as `re.escape(expect)` anchored with `^\s*`, its `error`
-  markers as `re.escape(marker)`, which preserves hail behaviour for existing maps. The
+  map's `expect` string is compiled as `re.escape(expect)` anchored with `^\s*` (an empty
+  `expect` becomes the never-matching `(?!)`), its `error` markers as `re.escape(marker)`,
+  which preserves hail behaviour for existing maps. The
   conversion lives in U3 (`Command.expect_regex`, `Command.error_regexes`); `Session.cmd`
   only ever sees regexes.
 
