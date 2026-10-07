@@ -1,41 +1,13 @@
 """Line engine. The `test_<name>` cases named after hail's line tests (src/lib.rs) are its
-one-to-one ports; hail's port-level cases (timeout, disconnect) belong to the session tests."""
+one-to-one ports; hail's marker cases are `Command.expect_regex`'s (test_profile.py) and its
+port-level cases (timeout, disconnect) the session's."""
 
 from __future__ import annotations
 
-import pytest
-
-from benchctl.linebuf import Classification, LineEngine, classify, strip_ansi, take_line
+from benchctl.linebuf import LineEngine, strip_ansi, take_line
 from fakedev import DEFAULT_BOOT, ELF_SHA_PREFIX, PROMPT, RST_POWERON
 
-
-def _expect(data: bytes, success: list[str], error: list[str]) -> tuple[Classification, str] | None:
-    """hail's `expect` over one read: the first line not skipped, trimmed, or None when the
-    input runs out (hail's timeout or disconnect)."""
-    for line in LineEngine().feed(data):
-        outcome = classify(line, success, error)
-        if outcome != "skip":
-            return outcome, line.strip()
-    return None
-
-
 # hail ports
-
-
-def test_expect_returns_success_and_skips_noise() -> None:
-    data = b"boot banner\r\nstray line\r\nCLEARED ok\r\n> "
-    assert _expect(data, ["CLEARED"], ["ERROR"]) == ("success", "CLEARED ok")
-    engine = LineEngine()
-    engine.feed(data)
-    assert engine.tail == "> "
-
-
-def test_expect_errors_on_error_marker() -> None:
-    assert _expect(b"ERROR: bad arg\r\n", ["CLEARED"], ["ERROR"]) == ("error", "ERROR: bad arg")
-
-
-def test_empty_success_marker_never_matches() -> None:
-    assert _expect(b"noise\r\n", [""], ["ERROR"]) is None
 
 
 def test_read_until_returns_prefix_and_consumes_marker() -> None:
@@ -138,17 +110,3 @@ def test_fake_boot_reassembles_split_writes() -> None:
     assert len(lines) == 1 + len(DEFAULT_BOOT) - 2  # two lines arrive in two writes each
     assert not any("\x1b" in line for line in lines)
     assert engine.tail == PROMPT
-
-
-@pytest.mark.parametrize(
-    ("line", "expected"),
-    [
-        ("", "skip"),
-        ("   \t", "skip"),
-        ("  CLEARED ok  ", "success"),
-        ("CLEARED but ERROR", "error"),
-        ("not CLEARED", "skip"),
-    ],
-)
-def test_classify_trims_and_checks_error_first(line: str, expected: Classification) -> None:
-    assert classify(line, ["CLEARED"], ["ERROR"]) == expected

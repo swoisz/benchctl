@@ -50,8 +50,9 @@ class PySerialTransport:
         port.baudrate = baud
         port.timeout = READ_TIMEOUT
         port.exclusive = True
-        # Set before open() so the lines never rise: on the bench adapter a raised line is a
-        # reset. pyserial itself ignores the ENOTTY a pty answers with.
+        # Low before open() so pyserial never raises them afterwards. The bench adapter still
+        # resets the unit on open itself; the session arms for that (Section 4.9). pyserial
+        # ignores the ENOTTY a pty answers with.
         port.dtr = False
         port.rts = False
         try:
@@ -109,13 +110,6 @@ class PySerialTransport:
                 self._port.reset_input_buffer()
         except (serial.SerialException, OSError) as exc:
             raise TransportLost(f"{self.path}: {exc}") from exc
-
-    def set_baud(self, baud: int) -> None:
-        # A refused rate (a pty, a driver without custom bauds) is not a lost port.
-        try:
-            self._port.baudrate = baud
-        except (serial.SerialException, OSError, ValueError) as exc:
-            raise DeviceError(f"{self.path}: cannot set baud {baud}: {exc}") from exc
 
     def close(self) -> None:
         # Closing a port whose device already vanished can fail; it is closed either way.

@@ -1,21 +1,17 @@
 """Bytes to lines: incremental UTF-8, `\\n`/`\\r\\n`/bare `\\r` terminators, ANSI stripping
-(design Section 4.3). A port of hail's RxBuf, take_line, strip_ansi and classify.
+(design Section 4.3). A port of hail's RxBuf, take_line and strip_ansi.
 """
 
 from __future__ import annotations
 
 import codecs
 import re
-from collections.abc import Sequence
-from typing import Literal
 
 # CSI: ESC [ then parameter/intermediate bytes up to a final byte in 0x40-0x7E. Anything
 # outside the final range counts as a parameter, as in hail, so an unterminated sequence
 # runs to the end of the text instead of leaking its parameters.
 _CSI = re.compile(r"\x1b\[[^\x40-\x7e]*[\x40-\x7e]?")
 _TERMINATOR = re.compile(r"[\r\n]")
-
-Classification = Literal["success", "error", "skip"]
 
 
 def strip_ansi(text: str) -> str:
@@ -38,20 +34,6 @@ def take_line(buf: str) -> tuple[str, str] | None:
         if buf[end] == "\n":
             end += 1
     return buf[:start], buf[end:]
-
-
-def classify(line: str, success: Sequence[str], error: Sequence[str]) -> Classification:
-    """hail's marker match: error if the trimmed line contains an error marker, success if it
-    starts with a non-empty success marker, otherwise skip."""
-    trimmed = line.strip()
-    if not trimmed:
-        return "skip"
-    if any(marker in trimmed for marker in error):
-        return "error"
-    # An empty marker would match every line.
-    if any(marker and trimmed.startswith(marker) for marker in success):
-        return "success"
-    return "skip"
 
 
 class LineEngine:

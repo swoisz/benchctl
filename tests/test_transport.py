@@ -72,8 +72,7 @@ def test_settings_round_trip_restores_baud_and_discards_input(
     transport.reset()
     time.sleep(0.15)  # the whole boot is buffered, unread
     # A standard rate: a pty refuses the custom-rate ioctl a 921600 needs on macOS.
-    transport.set_baud(230400)
-    assert transport.raw.baudrate == 230400
+    transport.raw.baudrate = 230400
     transport.apply_settings(saved)
     assert transport.raw.baudrate == 115200
     assert transport.read(4096, 0.05) == b""
