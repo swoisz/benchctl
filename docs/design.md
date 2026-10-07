@@ -74,6 +74,7 @@ benchctl/
     errors.py              # BenchctlError(code) hierarchy → exit codes      [scaffold]
     paths.py               # config/state dir resolution, env overrides     [scaffold]
     durations.py           # "50s"/"15m" parsing                            [scaffold]
+    defaults.py            # one home for shared defaults: reset wait, wait timeout, log limit, progress tick, `<redacted>`, iso_now  [U5]
     linebuf.py             # LineEngine: bytes→UTF-8→lines, tail, ANSI      [U2]
     idf.py                 # ESP-IDF line parsing, reset/sha detection       [U2]
     redact.py              # Redactor built from profile patterns           [U2]
@@ -169,8 +170,10 @@ Unit names are path components: `[A-Za-z0-9][A-Za-z0-9_.-]*`, and `runs` is rese
 ### 3.3 Auto-attach
 
 1. Client connects to `<state>/<unit>/sock`. Success → send `hello`.
-2. `ENOENT`/`ECONNREFUSED` → remove a stale socket file if the pidfile's process is dead →
-   spawn the daemon: `Popen([sys.executable, "-m", "benchctl", "daemon", "--unit", U],
+2. `ENOENT`/`ECONNREFUSED` → the daemon is dead when the pidfile's process is gone, or when
+   that pid is alive but `lease.lock` is free (a reused pid after a reboot; the probe is one
+   `LOCK_NB` flock, released at once, and runs only on this refused-socket path) → remove a
+   stale socket file → spawn the daemon: `Popen([sys.executable, "-m", "benchctl", "daemon", "--unit", U],
    start_new_session=True, stdin=DEVNULL, stdout=stderr=<state>/<unit>/daemon.log)`.
    `BENCHCTL_DAEMON_ARGV` (space-separated) replaces the program only; `--unit U` is always
    appended. It is the test seam that lets the CLI tests spawn `tests/fake_daemon.py`. The
@@ -184,7 +187,8 @@ Unit names are path components: `[A-Za-z0-9][A-Za-z0-9_.-]*`, and `runs` is rese
    session → bind, so a connected client always talks to a live session.
 4. The daemon takes the port lock first (`lease.lock`, `flock(LOCK_EX|LOCK_NB)`). Two
    clients racing to spawn: the loser's daemon exits 3 within a second; the loser client's
-   poll then finds the winner's socket. No TOCTOU on the port itself: the daemon opens it
+   poll then finds the winner's socket, or, if the winner dies starting up, re-checks the
+   pidfile and spawns again (exit 3 is forgotten, not kept as "our daemon"). No TOCTOU on the port itself: the daemon opens it
    with pyserial `exclusive=True` (POSIX `flock`), so a stray `idf.py monitor` or esptool
    fails fast instead of stealing bytes, and vice versa.
 5. `attach` is this same path, run explicitly, followed by `identity` (mutating, so a
@@ -196,7 +200,9 @@ Unit names are path components: `[A-Za-z0-9][A-Za-z0-9_.-]*`, and `runs` is rese
   worktree root if inside one, else the plain cwd.
 - `lease.json`: `{"owner": str, "since": iso8601, "last_seen": iso8601, "daemon_pid": int}`.
   Written by the daemon on acquire/take, and `last_seen` refreshed in memory on every
-  request from the owner and flushed to disk every 5 s. The daemon's liveness is
+  request from the owner, on every progress tick of the owner's blocking op and on every
+  tick of its `tail` (a long `wait` or `human` step must not read as idle), and flushed to
+  disk every 5 s. The daemon's liveness is
   `lease.lock` + pid, not the heartbeat.
 - Every request carries `owner` (in `hello`). The lease is acquired by the owner's first
   mutating op, not by `hello`, so a watcher never holds it. Mutating ops (`cmd`, `reset`,
@@ -256,7 +262,6 @@ class Transport(Protocol):                         # implemented by U4; used by 
     def reset(self, bootloader: bool = False) -> None: ...
     def get_settings(self) -> dict: ...
     def apply_settings(self, s: dict) -> None: ...  # restores the saved settings AND discards pending input; callers do nothing more
-    def set_baud(self, baud: int) -> None: ...
     def close(self) -> None: ...
     @property def raw(self) -> serial.Serial: ...  # for esptool only
 
@@ -340,7 +345,7 @@ exists for the wire-only codes `slow_client`/`protocol` that have no subclass. S
 
 ### 4.3 Line engine (`linebuf.py`) **[portable semantics]**
 
-Port of hail's `RxBuf`/`take_line`/`strip_ansi`/`classify`:
+Port of hail's `RxBuf`/`take_line`/`strip_ansi`:
 
 - `LineEngine.feed(bytes) -> list[str]`: incremental UTF-8 decode
   (`codecs.getincrementaldecoder("utf-8")(errors="replace")`): a multibyte char split
@@ -358,13 +363,12 @@ Port of hail's `RxBuf`/`take_line`/`strip_ansi`/`classify`:
   no consuming `read_until`: a marker stays in the tail (hail's test keeps its name and
   asserts this).
 - `LineEngine` is per reader: make a fresh one after a reconnect or a flash.
-- `classify(line, success: list[str], error: list[str]) -> "success"|"error"|"skip"`:
-  trimmed line; empty → skip; error if the line **contains** any error marker; success if
-  it **starts with** a non-empty success marker (hail semantics). benchctl's `cmd --expect`
-  is a regex instead; the map's `expect` string is compiled as `re.escape(expect)` anchored
-  with `^\s*` (hail matched the trimmed line), which preserves hail behaviour for existing
-  maps. The conversion lives in U3 (`Command.expect_regex`, `Command.error_regexes`);
-  `Session.cmd` only ever sees regexes.
+- hail's `classify` (success marker **starts** the trimmed line, error marker is
+  **contained**) is not ported as a function: `cmd --expect`/`--error` are regexes, and the
+  map's `expect` string is compiled as `re.escape(expect)` anchored with `^\s*`, its `error`
+  markers as `re.escape(marker)`, which preserves hail behaviour for existing maps. The
+  conversion lives in U3 (`Command.expect_regex`, `Command.error_regexes`); `Session.cmd`
+  only ever sees regexes.
 
 ### 4.4 ESP-IDF detection (`idf.py`)
 
@@ -378,10 +382,11 @@ Port of hail's `RxBuf`/`take_line`/`strip_ansi`/`classify`:
   `boot`). An optional `reason` that did not participate reads `"unknown"`; `code` is parsed
   as hex with or without `0x`, `null` when it is not hex.
 - ELF SHA line: default `ELF file SHA256:\s*(?P<sha>[0-9a-fA-F]+)`. The device prints a
-  prefix (IDF's `CONFIG_APP_RETRIEVE_LEN_ELF_SHA`); `sha_matches(device_sha, app_elf_sha256)`
-  is a case-insensitive prefix match, false for an empty device sha.
+  prefix (IDF's `CONFIG_APP_RETRIEVE_LEN_ELF_SHA`); it is recorded on the reset and in the
+  `elf_sha` event, and nothing in v1 compares it with a build's `AppDesc`.
 - Reboot inference: an IDF line whose device_ms is lower than the previous one by more than
-  `boot.ms_regression` (default 1000) with no reset line in between → synthetic reset
+  `boot.ms_regression` (default 1000; `0` disables it, for a firmware whose deferred or
+  buffered log replays older timestamps) with no reset line in between → synthetic reset
   `reason: "unknown"`, `code: null`, `inferred: true`. Any matched reset line (default or
   profile pattern, IDF-shaped or not) clears the baseline; the next IDF line starts it.
 - API: `IdfDetector(reset_patterns, sha_pattern, ms_regression).feed(text) -> Detection |
@@ -403,7 +408,9 @@ Port of hail's `RxBuf`/`take_line`/`strip_ansi`/`classify`:
   it). Attach arms `"attach"` before its one explicit pulse. An adapter that also resets on
   open could in principle deliver that boot's `rst:` line first and spend the arm; at
   115200 the line cannot complete before the pulse lands (~5 ms after open), so this is a
-  Section 9 bench check, not a code path. `cause` is `"attach"`, `"reset"`, `"flash"`,
+  Section 9 bench check, not a code path. A reconnect arms `"port_back"` the same way, after
+  its open succeeded and before the reader resumes, because reopening the bench adapter
+  resets the unit. `cause` is `"attach"`, `"port_back"`, `"reset"`, `"flash"`,
   `"cmd:<line as logged>"`, or the runner's `"step:<n>"`. Expected resets carry `context: []`.
 - Otherwise `expected: false, cause: null, context: <last 20 stored lines before it>`.
 - A reset inferred from a device-ms regression (Section 4.4) is a `reset` with `reason:
@@ -460,15 +467,17 @@ booting for > boot.ready_timeout, or unknown  → probe: send boot.probe + line_
   line will get); `mark NAME` writes `## mark NAME` and returns that line's own offset (a
   meta line, so a wait from it sees everything after). A name that parses as a cursor
   (`attach`, `boot`, digits) is `usage`. Marks do not survive detach.
-- Memory holds the whole session (`list[LogLine]`); the file is the durable copy. At
-  115200 baud the ceiling is ~40 MB/hour of pure text, acceptable for bench sessions; the
-  design does not page to disk.
+- Memory holds the whole session (`list[LogLine]`); the file is the durable copy. A
+  saturated 115200 line is ~40 MB/hour of text, and at ~250 B per 80-character `LogLine`
+  all in (~520k lines/hour) ~130 MB/hour resident; bench rates are far lower, so the design
+  does not page or prune. Section 9 records the daemon's RSS after the longest soak.
 - `serial.log` line format: `HH:MM:SS.mmm +SSSSS.mmm <text>` where `+t` is seconds since
   attach with three decimals. First line: `## attach unit=<u> port=<p> baud=<b> at=<iso>`.
 - Meta lines are benchctl's own and start with `## `: `## tx <line>` (what was sent,
   redacted; `## tx <redacted>` when `secret`), `## reset requested bootloader=true|false`,
   `## flash begin|end …` (written by U6 through `Session.note`), `## mark <name>`,
-  `## probe`, `## port lost|back …`. They occupy offsets so `cmd` can return its `tx` offset
+  `## probe`, `## port lost|back …`, `## reconnect failed <error>` (once per distinct
+  error, so a permanent failure is readable in the log). They occupy offsets so `cmd` can return its `tx` offset
   and a `wait --since <that>` cannot miss the reply.
 
 ### 4.8 Redaction (`redact.py`)
@@ -508,7 +517,7 @@ booting for > boot.ready_timeout, or unknown  → probe: send boot.probe + line_
   `esptool.reset` so the sequence is never re-implemented here. The reset strategy is a
   `ModemLines` callable injected at construction (default pulses the real lines; tests
   inject a hook that calls the fake device's `reset()`), because RTS/DTR ioctls fail on a
-  pty. A failed pulse is `TransportLost`; `set_baud` refused by the driver is `DeviceError`.
+  pty. A failed pulse is `TransportLost`.
 - Attach: write meta line 0, arm `attach`, discard whatever a reset-on-open already
   printed (`apply_settings(get_settings())`), start the reader, then pulse one reset.
 - Loss: pyserial raises `SerialException` ("device reports readiness to read but returned
@@ -521,7 +530,10 @@ booting for > boot.ready_timeout, or unknown  → probe: send boot.probe + line_
   `TransportLost`, code `device`). A port esptool closed underneath reads as `TransportLost`
   too, and `apply_settings` tolerates a closed port, so a failed flash recovers this way.
   After `reconnect_timeout` (default 120 s) it keeps trying every 5 s; `status` shows
-  `connected: false`. Waits are bounded by their own timeouts regardless.
+  `connected: false`. An attempt that fails for a new reason (two ports now match, the unit
+  came back with another VID) writes `## reconnect failed <error>` and a warning to
+  `daemon.log`, once per distinct message. A successful reopen arms `"port_back"` (Section
+  4.5) before the reader resumes. Waits are bounded by their own timeouts regardless.
 
 ### 4.10 Flashing on the held handle (`flash.py`)
 
@@ -703,7 +715,8 @@ def validate_paths(paths: list[Path]) -> list[dict[str, object]]: ... # the `val
   declared value is smaller than the computed one.
 - Before the preconditions: `status` (unit, attach time), then `identity` — the probe runs
   here, not lazily inside the first `mark`, so `fw`/`dev` tag the run's records and
-  `results.md` even when the run itself attached — then the first `mark`.
+  `results.md` even when the run itself attached — then the first `mark`, and only then the
+  run dir (a failure in those three calls leaves no half-written run dir behind).
 - Preconditions: `fw_version` regex against `identity.fw_version`; `env_gate = true` runs
   `gate_check(since=boot, timeout=env_gate.timeout)` from the profile. Failures stop the run
   before step 1 (result `precondition_failed`, exit 1).
@@ -721,7 +734,9 @@ def validate_paths(paths: list[Path]) -> list[dict[str, object]]: ... # the `val
 - `expect_reset = true` arms `arm_reset("step:<n>", span + boot.expected_reset_window)` at
   step start, where `span` (`runner.step_span`) is the step's timeout or a wait's declared
   `window` when longer; put it on the step during which the `rst:` line is expected to
-  arrive. `compute_budget` sums the same spans.
+  arrive. `compute_budget` sums the same spans. On such a step a `cmd` is sent with
+  `reboots = false` whatever its map entry says: the session's own `cmd:` arm would replace
+  the step's wider one.
 - `human`: print the prompt (stderr and the terminal bell), then `wait(confirm, since=step,
   timeout)`. The human never says "done".
 - `external`: shell command in its own process group (`start_new_session`), env merged over
@@ -740,7 +755,7 @@ def validate_paths(paths: list[Path]) -> list[dict[str, object]]: ... # the `val
   steps, during the preconditions, during an undo, during the final log fetch): the current
   step (or undo) becomes `error`, the remaining steps `skip`, the remaining undos still run,
   and `run_scenario` returns `fail` with the run dir written; it does not re-raise. Before
-  the preconditions (run dir setup, `status`, `identity`, the first `mark`) there is nothing to undo and
+  the preconditions (`status`, `identity`, the first `mark`, then run dir setup) there is nothing to undo and
   the interrupt propagates. SIGTERM is caught only in the main thread and the previous
   handler is restored on return.
 - Output: run dir (Section 7.6). The runner subscribes to the daemon's event stream for the
@@ -886,7 +901,8 @@ name. Unknown mark → `usage`.
 `wait` argument rules: `PATTERN` is required unless `--order` or `--absent` is given;
 `PATTERN` and `--order` are exclusive (`usage`); `--absent` alone checks absence over
 `--window` (default: the timeout); `PATTERN` + `--absent` requires the pattern to match and
-the absent pattern not to appear before it, and a given `--window` then extends the absence
+the absent pattern not to appear on or before the matching line (a line that does both is
+`absent_violated`), and a given `--window` then extends the absence
 watch to `window` seconds from the call even past the match, so the wait returns at the
 later of the two. `--window` means nothing without `--absent`: a plain pattern or order
 wait returns at its match whatever window was sent. `--order` requires each pattern to
@@ -934,7 +950,7 @@ offset; `cmd` prints the captured text or the matched line; `wait` prints the ma
 | `flash` | `files: [{addr, path, name}], after, baud, flash_args: {flash-mode, flash-size, flash-freq}` (client-resolved) | `FlashResult` |
 | `capture` | `seconds` | `lines, reset` |
 | `identity` | `reprobe, override` (`attach --no-verify`: accept a mismatch for this daemon's life) | `Identity`; a mismatch without override is `device` |
-| `gate` | `since, timeout` | `ok: bool, missing: [str], forbidden_hits: [{pattern, line, offset}]` |
+| `gate` | `since, timeout` | `ok: bool, missing: [str], forbidden_hits: [{pattern, line, offset}]`; returns early only on a forbidden hit or once every `require` entry is found, so a forbid-only gate watches the whole `timeout` |
 | `tail` | `since, events: bool` | stream |
 | `lease` | `action: take\|release` | `{"lease": object\|null}` |
 | `detach` | | `{}` then the daemon exits |
@@ -969,7 +985,7 @@ probe_interval = 1.0
 reset_patterns = []           # extra regexes with named groups reason (required), code, boot
 sha_pattern = 'ELF file SHA256:\s*(?P<sha>[0-9a-fA-F]+)'
 expected_reset_window = 10.0
-ms_regression = 1000          # device-ms drop that implies a missed reset
+ms_regression = 1000          # device-ms drop that implies a missed reset; 0 turns inference off
 
 [[identity.field]]
 name = "fw_version"           # fw_version is the field used to tag events
@@ -1171,6 +1187,7 @@ run = "./cloud.py rpc reboot"              # shell; {var} placeholders from --va
 kind = "cmd"
 at = "+11s"
 send = "mqtt_silent 600"                   # or: command = "<map name>", args = { k = "v" }
+# secret = true                            # the line carries a --var secret: sent like `cmd --secret` (Section 4.8)
 # expect = "…"  error = ["…"]  capture = true  timeout = "8s"
 
 [[step]]
@@ -1197,8 +1214,9 @@ name = "after_flash"
 ```
 
 Durations: `^\d+(\.\d+)?(ms|s|m|h)?$`; a bare number is seconds. `at` is `+<duration>`; the
-`+` is required. Validation: `kind` in the set; kind-specific required keys present
-(`human`: `prompt`, `confirm`; `external`: `run`; `cmd`: `send` xor `command`, `args` only
+`+` is required. Validation: at least one `[[step]]` (an empty scenario would pass by doing
+nothing); `kind` in the set; kind-specific required keys present
+(`human`: `prompt`, `confirm`; `external`: `run`; `cmd`: `send` xor `command`, `secret` a bool, `args` only
 with `command`, `capture = true` exclusive with `expect`; `wait`: one of
 `pattern`/`absent`/`order`, `pattern` exclusive with `order`, `window` only with `absent`;
 `flash`: `artifacts` xor `files`, `only` only with `artifacts`; `mark`: `name`, which may not be a cursor keyword
@@ -1209,7 +1227,7 @@ unknown keys are errors. Errors are `<file>: step[n].<key>: <message>` with `n` 
 the number `results.md` shows.
 
 Loader output (what the runner receives): durations as float seconds; `Step.index` from 1;
-`Step.trigger` defaults true for `human`/`wait`; `Step.timeout` is `None` when absent and
+`Step.trigger` defaults true for `human`/`wait`; `Step.secret` defaults false; `Step.timeout` is `None` when absent and
 the runner applies the per-kind default — `cmd`: the step's, else the map entry's, else
 `console.timeout`; `wait`: 60 s; `human`: 10 m; `external`: 60 s; `reset`: 5 s; `flash`:
 5 m; `mark`: 0 — the same numbers `compute_budget` sums, plus each `at`; a `wait` counts
@@ -1263,7 +1281,8 @@ prompt in the tail, after `vanish()` the slave read raises `SerialException`, an
 
 **U2 text layer** — `linebuf.py`, `idf.py`, `redact.py` + tests.
 Acceptance: hail's tests pass ported one-to-one — `expect_returns_success_and_skips_noise`,
-`expect_errors_on_error_marker`, `empty_success_marker_never_matches`,
+`expect_errors_on_error_marker` and `empty_success_marker_never_matches` as U3
+`Command.expect_regex`/`error_regexes` cases (Section 4.3),
 `read_until_returns_prefix_and_consumes_marker`, `next_line_reads_sequentially`,
 `utf8_multibyte_split_across_reads`, `strip_ansi_removes_csi`,
 `strip_ansi_handles_non_letter_finals`, `take_line_handles_lf_crlf_and_bare_cr`,
@@ -1301,7 +1320,7 @@ afterwards; redaction is applied before storage (`sip_pass=***` in `serial.log`,
 secret).
 
 **U5 daemon, client, CLI, docs** — `daemon.py`, `lease.py`, `client.py`, `cli.py`,
-`monitor.py`, `SKILL.md`, `README.md` body, `tests/fake_daemon.py` + tests.
+`monitor.py`, `defaults.py`, `SKILL.md`, `README.md` body, `tests/fake_daemon.py` + tests.
 Acceptance: with `BENCHCTL_DAEMON_ARGV` pointing at `fake_daemon.py` (real `daemon.py` over a
 `FakeSession`): auto-attach spawns and connects; two clients racing attach yield one
 daemon; owner mismatch gives exit 3 with `busy: held by … since …` for mutating ops and 0
@@ -1369,6 +1388,13 @@ and every scenario, and nothing device-specific (hostnames, credentials) lands i
   events appear and `cmd` works afterwards.
 - The device profile's acceptance scenarios run end to end and produce a `results.md`
   that drops into the PR body.
+- Review follow-ups (Section 4.7, 4.8, 4.4): the daemon's RSS after the longest soak,
+  against the ~250 B/line figure; what the device console echoes for a `cmd --secret`
+  line (a redrawn or truncated echo defeats the whole-line mask → ticket); whether
+  `deferred_log` replays trigger inferred resets during a normal session (if so the
+  profile sets `ms_regression = 0`), and with inference off, that a replug mid-boot still
+  refreshes `status.last_reset.elf_sha` (else ticket); the gate reaches `ready` on the real
+  prompt without a `## probe` stream.
 - Open question from the spec stays open: whether a different adapter opens without
   resetting; `attach` must still behave (gate probe path) when it does not.
 
