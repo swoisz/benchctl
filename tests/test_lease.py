@@ -16,6 +16,7 @@ from benchctl.lease import (
     LeaseManager,
     PortLock,
     default_owner,
+    lock_held,
     pid_alive,
     read_lease,
     stale_after,
@@ -195,3 +196,29 @@ def test_release_all_on_shutdown(manager: LeaseManager, events: list[Event]) -> 
         "owner": None,
         "prev_owner": "alice",
     }
+
+
+def test_lock_held_probes_without_keeping_the_lock(tmp_path: Path) -> None:
+    path = tmp_path / "lease.lock"
+    assert not lock_held(path)
+    holder = PortLock(path)
+    assert holder.acquire()  # the probe released it again
+    assert lock_held(path)
+    holder.release()
+    assert not lock_held(path)
+    assert lock_held(tmp_path / "missing" / "lease.lock")  # cannot even open: counts as held
+
+
+def test_touch_refreshes_only_the_owners_lease(
+    manager: LeaseManager, clock: Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(STALE_ENV, "60")
+    manager.touch("alice")
+    assert manager.current() is None  # never acquires
+    manager.admit("alice", mutating=True)
+    clock.now += 50
+    manager.touch("bob")
+    manager.touch("alice")
+    clock.now += 50
+    with pytest.raises(BusyError):
+        manager.admit("bob", mutating=True)

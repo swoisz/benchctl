@@ -19,6 +19,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from benchctl.defaults import iso_now
 from benchctl.errors import BusyError, UsageError
 from benchctl.types import Event
 
@@ -60,11 +61,6 @@ def pid_alive(pid: int) -> bool:
     return True
 
 
-def now_iso() -> str:
-    """Host time, ISO 8601 with offset, ms precision (the Section 7.5 `ts` format)."""
-    return datetime.now().astimezone().isoformat(timespec="milliseconds")
-
-
 def stale_after() -> float:
     """Seconds without a request from the owner after which another owner may take over."""
     text = os.environ.get(STALE_ENV)
@@ -77,6 +73,22 @@ def stale_after() -> float:
     if value < 0:
         raise UsageError(f"{STALE_ENV}={text!r}: must not be negative")
     return value
+
+
+def lock_held(path: Path) -> bool:
+    """Whether some process holds `path` (a daemon's `lease.lock`). Probing takes the lock for
+    an instant when it is free; a lock that cannot even be opened counts as held."""
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    except OSError:
+        return True
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return True
+    finally:
+        os.close(fd)
+    return False
 
 
 class PortLock:
@@ -202,6 +214,17 @@ class LeaseManager:
                 lease = self._set(owner, "take", lease["owner"])
             return dict(lease)
 
+    def touch(self, owner: str) -> None:
+        """Refresh `last_seen` while `owner`'s long op runs; never acquires."""
+        with self._lock:
+            lease = self._lease
+            if (
+                lease is not None
+                and lease["owner"] == owner
+                and lease.get("daemon_pid") == self._pid
+            ):
+                self._touch(lease)
+
     def release(self, owner: str) -> None:
         """Free the lease. Only its owner may, unless it is stale."""
         with self._lock:
@@ -227,12 +250,12 @@ class LeaseManager:
 
     def _touch(self, lease: dict[str, Any]) -> None:
         self._seen = self._clock()
-        lease["last_seen"] = _iso(self._seen)
+        lease["last_seen"] = iso_now(self._seen)
         self._dirty = True
 
     def _set(self, owner: str, action: str, prev: str | None) -> dict[str, Any]:
         self._seen = self._clock()
-        stamp = _iso(self._seen)
+        stamp = iso_now(self._seen)
         lease = {"owner": owner, "since": stamp, "last_seen": stamp, "daemon_pid": self._pid}
         self._lease = lease
         _write_json(self._path, lease)
@@ -247,10 +270,6 @@ class LeaseManager:
         with contextlib.suppress(FileNotFoundError):
             self._path.unlink()
         self._emit({"type": "lease", "action": "release", "owner": None, "prev_owner": prev})
-
-
-def _iso(timestamp: float) -> str:
-    return datetime.fromtimestamp(timestamp).astimezone().isoformat(timespec="milliseconds")
 
 
 def _busy(lease: dict[str, Any]) -> BusyError:

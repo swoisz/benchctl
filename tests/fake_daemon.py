@@ -23,8 +23,9 @@ from typing import Any, Literal
 
 from benchctl import capture, daemon, flash, paths
 from benchctl.artifacts import read_app_desc, sha256_file
+from benchctl.defaults import PROGRESS_S, REDACTED, RESET_WAIT_S, iso_now
 from benchctl.errors import InternalError, TimeoutError_, UsageError
-from benchctl.lease import now_iso, pid_alive
+from benchctl.lease import pid_alive
 from benchctl.profile import Profile
 from benchctl.registry import Unit
 from benchctl.types import (
@@ -90,13 +91,14 @@ class FakeSession:
         self._lazy = bool(config.get("identity_lazy", False))
         self._probe_s = float(config.get("identity_delay_s", 0.0))
         self._never_ready = bool(config.get("identity_timeout", False))
+        self._refuse_cmds = bool(config.get("shell_not_ready", False))
         self._device = threading.RLock()
         self._cond = threading.Condition()
         self._lines: list[LogLine] = []
         self._marks: dict[str, Offset] = {}
         self._subs: list[Subscription] = []
         self._t0 = time.monotonic()
-        self._attached_at = now_iso()
+        self._attached_at = iso_now()
         self._seq = 0
         self._boot: Offset = 0
         self._gate = GateState("ready", 0.0, "pattern")
@@ -215,7 +217,11 @@ class FakeSession:
         start = time.monotonic()
         with self._device:
             self.profile.check_allowed(line)
-            tx = self.note(f"tx {'<redacted>' if secret else line}")
+            if self._refuse_cmds and not force:
+                # Section 4.6: nothing is sent, offset is the next one, line names the state.
+                refusal = "shell not ready (state=booting)"
+                return CmdResult(len(self._lines), "timeout", refusal, [], None, 0.0)
+            tx = self.note(f"tx {REDACTED if secret else line}")
             word = line.split()[0] if line.split() else ""
             if word == "reboot":
                 self._boot_sequence(RST_POWERON, expected=True, cause=f"cmd:{line}")
@@ -308,7 +314,7 @@ class FakeSession:
         return lines[:limit]
 
     def reset(
-        self, bootloader: bool, wait_rst: float = 5.0, *, cause: str = "reset"
+        self, bootloader: bool, wait_rst: float = RESET_WAIT_S, *, cause: str = "reset"
     ) -> ResetInfo | None:
         with self._device:
             self.note(f"reset requested bootloader={str(bootloader).lower()}")
@@ -357,7 +363,7 @@ class FakeSession:
             self._seq += 1
             record = {
                 "seq": self._seq,
-                "ts": now_iso(),
+                "ts": iso_now(),
                 "t": round(self._now(), 3),
                 "unit": self.unit,
                 "fw": self._fields.get("fw_version"),
@@ -412,14 +418,14 @@ def fake_flash_on_session(
     session.note(f"flash end status=ok chip={chip} before={before}")
     reset: ResetInfo | None = None
     if after == "hard-reset":
-        reset = session.reset(False, 5.0, cause="flash")
+        reset = session.reset(False, RESET_WAIT_S, cause="flash")
     else:
         session.set_gate("bootloader", method="flash")
     return FlashResult(images, app, baud, time.monotonic() - start, reset)
 
 
 def fake_capture_on_session(session: Any, seconds: float) -> tuple[list[LogLine], ResetInfo | None]:
-    reset = session.reset(False, 5.0)
+    reset = session.reset(False, RESET_WAIT_S)
     since = 0 if reset is None else reset.offset
     lines: list[LogLine] = session.log(since, None, None, 10_000)
     return lines, reset
@@ -483,9 +489,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--unit", required=True)
     parser.add_argument("--profile", default=os.environ.get("BENCHCTL_PROFILE"))
     args = parser.parse_args(argv)
+    config = knobs()
+    marker = config.get("lose_race_once")
+    if isinstance(marker, str) and not Path(marker).exists():
+        # Act out a daemon that lost the lease.lock race and exited, once.
+        Path(marker).touch()
+        print(
+            json.dumps({"ok": False, "error": {"code": "busy", "message": "lost"}}), file=sys.stderr
+        )
+        return 3
     flash.flash_on_session = fake_flash_on_session
     capture.capture_on_session = fake_capture_on_session
-    progress = float(knobs().get("progress_s", daemon.PROGRESS_S))
+    progress = float(config.get("progress_s", PROGRESS_S))
     return daemon.main(
         args.unit, args.profile, session_factory=FakeSession, progress_interval=progress
     )
