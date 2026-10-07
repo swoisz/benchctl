@@ -8,11 +8,11 @@ from datetime import datetime
 
 import serial
 
+from benchctl.defaults import RESET_WAIT_S
 from benchctl.errors import DeviceError, UsageError
 from benchctl.linebuf import LineEngine
 from benchctl.types import LogLine, ModemLines, ResetInfo, Session
 
-RESET_WAIT_S = 5.0
 READ_TIMEOUT_S = 0.1  # the Section 4.9 port settings
 _US_PER_MS = 1000
 # flock(LOCK_EX | LOCK_NB) on a port another process holds.

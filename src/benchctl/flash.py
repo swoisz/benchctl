@@ -13,12 +13,12 @@ from typing import Any
 import serial
 
 from benchctl import artifacts
+from benchctl.defaults import RESET_WAIT_S
 from benchctl.errors import BenchctlError, DeviceError, UsageError
 from benchctl.linebuf import LineEngine
+from benchctl.profile import FLASH_AFTER
 from benchctl.types import AppDesc, FlashFile, FlashResult, Session
 
-AFTER_MODES = ("hard-reset", "no-reset")
-RESET_WAIT_S = 5.0
 FLASH_CAUSE = "flash"  # the reset-arming cause and the gate method
 # pyserial's message for a failed `exclusive=True` open; esptool embeds it in its FatalError.
 _LOCK_FAILURE = "Could not exclusively lock port"
@@ -55,8 +55,8 @@ class EventLineWriter(io.TextIOBase):
 
 
 def _check_after(after: str) -> None:
-    if after not in AFTER_MODES:
-        raise UsageError(f"invalid after {after!r}: one of {', '.join(AFTER_MODES)}")
+    if after not in FLASH_AFTER:
+        raise UsageError(f"invalid after {after!r}: one of {', '.join(FLASH_AFTER)}")
 
 
 def _loader_class(chip: str) -> LoaderClass:

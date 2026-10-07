@@ -124,9 +124,6 @@ class FakeTransport:
         if self.restore_error is not None:
             raise self.restore_error
 
-    def set_baud(self, baud: int) -> None:
-        raise AssertionError("esptool owns the baud while paused; apply_settings restores it")
-
     def close(self) -> None:
         raise AssertionError("the session owns the port")
 
