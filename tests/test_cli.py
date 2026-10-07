@@ -4,8 +4,12 @@ with the daemon spawned as `tests/fake_daemon.py` (Section 6.2, U5)."""
 from __future__ import annotations
 
 import json
+import os
+import pty
 import shutil
 import tempfile
+import termios
+import threading
 from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import Any, cast
@@ -18,7 +22,14 @@ from benchctl.client import DAEMON_ARGV_ENV, Client, daemon_pid
 from benchctl.lease import OWNER_ENV, PortLock
 from benchctl.profile import load_profile
 from benchctl.runner import RunResult
-from benchctl.types import CmdResult, DeviceClient, FlashFile, FlashResult, LogLine
+from benchctl.types import (
+    CmdResult,
+    DeviceClient,
+    FlashFile,
+    FlashResult,
+    LogLine,
+    Subscription,
+)
 from conftest import PROFILE_NAME, UNIT, install_profile
 from fake_daemon import (
     APP_VERSION,
@@ -623,6 +634,43 @@ def test_monitor_reports_a_refused_line(
     assert fake.sent == ["version"]
     err = capsys.readouterr().err
     assert err == "benchctl: cmd timeout: shell not ready (state=booting)\n"
+
+
+class _TtyClient(_RefusingClient):
+    def tail(self, since: Any, events: bool) -> Subscription:
+        return Subscription()
+
+
+def test_monitor_exits_on_ctrl_bracket_from_a_terminal_without_enter(
+    bench: Path, config_dir: Path
+) -> None:
+    profile = load_profile(PROFILE_NAME, config_dir, config_dir)
+    master, slave = pty.openpty()
+    attrs = termios.tcgetattr(slave)
+    attrs[3] |= termios.ICANON  # canonical, as a shell leaves the terminal
+    attrs[3] &= ~termios.ECHO  # nobody reads the master's side here
+    attrs[6][termios.VEOL] = monitor.EXIT_CHAR.encode()
+    termios.tcsetattr(slave, termios.TCSANOW, attrs)
+    fake = _TtyClient()
+    stdin = os.fdopen(slave, "r", closefd=True)
+    done: list[int] = []
+    thread = threading.Thread(
+        target=lambda: done.append(
+            monitor.run_monitor(cast(DeviceClient, fake), profile, stdin, since=0)
+        ),
+        daemon=True,
+    )
+    thread.start()
+    os.write(master, b"version\r")
+    os.write(master, monitor.EXIT_CHAR.encode())  # no newline after it
+    thread.join(2.0)
+    exited_on_ctrl_bracket = not thread.is_alive()
+    os.close(master)  # a reader still blocked on the slave now ends instead of hanging
+    thread.join(2.0)
+    stdin.close()
+    assert exited_on_ctrl_bracket, "monitor waited for Enter after Ctrl-]"
+    assert done == [0]
+    assert fake.sent == ["version"]
 
 
 def test_monitor_sends_typed_lines_and_exits_on_ctrl_bracket(bench: Path) -> None:

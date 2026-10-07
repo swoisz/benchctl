@@ -7,6 +7,7 @@ exits.
 
 from __future__ import annotations
 
+import codecs
 import contextlib
 import io
 import os
@@ -26,6 +27,7 @@ RESET_COMMAND = "!reset"
 SOURCE = "monitor"
 _FEED_TICK_S = 0.2
 _JOIN_S = 1.0
+_READ_CHUNK = 1024
 
 
 def handle_line(client: DeviceClient, profile: Profile, line: str) -> bool:
@@ -63,8 +65,9 @@ def run_monitor(client: DeviceClient, profile: Profile, stdin: TextIO, *, since:
     printer = threading.Thread(target=_print_feed, args=(feed, stop), daemon=True)
     printer.start()
     try:
-        with _exit_key_ends_line(stdin):
-            while raw := stdin.readline():
+        with _exit_key_ends_line(stdin) as fd:
+            typed = _tty_lines(fd) if fd is not None else iter(stdin.readline, "")
+            for raw in typed:
                 if not handle_line(client, profile, raw.rstrip("\r\n")):
                     break
     except KeyboardInterrupt:
@@ -87,23 +90,43 @@ def _print_feed(feed: Subscription, stop: threading.Event) -> None:
             click.echo(item.text)
 
 
+def _tty_lines(fd: int) -> Iterator[str]:
+    """Typed lines straight from the terminal. The buffered `readline` would sit on a VEOL
+    read until a newline came, so Ctrl-] ends a line here as soon as it arrives."""
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    pending = ""
+    while chunk := os.read(fd, _READ_CHUNK):
+        pending += decoder.decode(chunk)
+        while (end := _line_end(pending)) >= 0:
+            yield pending[: end + 1]
+            pending = pending[end + 1 :]
+    if pending:
+        yield pending
+
+
+def _line_end(text: str) -> int:
+    ends = [i for i in (text.find("\n"), text.find(EXIT_CHAR)) if i >= 0]
+    return min(ends, default=-1)
+
+
 @contextlib.contextmanager
-def _exit_key_ends_line(stream: TextIO) -> Iterator[None]:
+def _exit_key_ends_line(stream: TextIO) -> Iterator[int | None]:
     """On a terminal, make Ctrl-] an extra end-of-line character so it is delivered at once
-    while the line editing of canonical mode stays (raw mode would lose it)."""
+    while the line editing of canonical mode stays (raw mode would lose it). Yields the
+    terminal's fd, or None when the input is not a terminal."""
     try:
         fd = stream.fileno()
     except (AttributeError, OSError, io.UnsupportedOperation):
-        yield
+        yield None
         return
     if not os.isatty(fd):
-        yield
+        yield None
         return
     saved = termios.tcgetattr(fd)
     changed = [*saved[:6], list(saved[6])]
     changed[6][termios.VEOL] = EXIT_CHAR.encode()
     termios.tcsetattr(fd, termios.TCSANOW, changed)
     try:
-        yield
+        yield fd
     finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+        termios.tcsetattr(fd, termios.TCSANOW, saved)  # DRAIN would wait on unread echo
