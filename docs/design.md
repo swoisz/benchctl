@@ -406,12 +406,12 @@ Port of hail's `RxBuf`/`take_line`/`strip_ansi`:
   for steps with `expect_reset = true`). Arming lasts `boot.expected_reset_window` (default
   10 s) from the arming moment and is consumed by the first reset it classifies, so a second
   reboot inside the window is unexpected (a crash right after a flash must not hide behind
-  it). Attach arms `"attach"` before its one explicit pulse. An adapter that also resets on
-  open could in principle deliver that boot's `rst:` line first and spend the arm; at
-  115200 the line cannot complete before the pulse lands (~5 ms after open), so this is a
-  Section 9 bench check, not a code path. A reconnect arms `"port_back"` the same way, after
+  it). Attach arms `"attach"` before its one explicit pulse. A reset line stored before that
+  pulse returns is the adapter's reset-on-open (the bench FTDI's lands ~30 ms after open,
+  while the pulse holds the chip in reset): it is `expected: true, cause: "open"` and leaves
+  the `attach` arm for the pulse's own boot. A reconnect arms `"port_back"` the same way, after
   its open succeeded and before the reader resumes, because reopening the bench adapter
-  resets the unit. `cause` is `"attach"`, `"port_back"`, `"reset"`, `"flash"`,
+  resets the unit. `cause` is `"open"`, `"attach"`, `"port_back"`, `"reset"`, `"flash"`,
   `"cmd:<line as logged>"`, or the runner's `"step:<n>"`. Expected resets carry `context: []`.
 - Otherwise `expected: false, cause: null, context: <last 20 stored lines before it>`.
 - A reset inferred from a device-ms regression (Section 4.4) is a `reset` with `reason:

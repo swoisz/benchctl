@@ -186,6 +186,28 @@ def test_attach_resets_once_and_stores_boot_lines_after_meta_line_zero(
     assert serial_log.splitlines()[0].endswith(lines[0].text)
 
 
+def test_reset_on_open_is_classified_apart_from_the_attach_pulse(
+    make_fakedev: FakeDeviceFactory, make_session: SessionFactory
+) -> None:
+    device = make_fakedev()
+    pulses: list[bool] = []
+
+    def adapter_that_resets_on_open(bootloader: bool) -> None:
+        # The bench FTDI: the open's boot is already printing when the pulse lands.
+        if not pulses:
+            device.reset()
+            time.sleep(0.05)
+        pulses.append(bootloader)
+        device.reset(bootloader)
+
+    session = make_session(device, lines=adapter_that_resets_on_open)
+    until(lambda: ready(session))
+    resets = events(session, "reset")
+    assert [(r["expected"], r["cause"]) for r in resets] == [(True, "open"), (True, "attach")]
+    last = session.status().last_reset
+    assert last is not None and (last.offset, last.cause) == (resets[1]["offset"], "attach")
+
+
 def test_unexpected_reset_carries_context_and_reset_op_is_expected(
     ready_session: DeviceSession, fakedev: FakeDevice
 ) -> None:

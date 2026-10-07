@@ -76,6 +76,7 @@ READER_ERROR_BACKOFF = 0.1
 FW_FIELD = "fw_version"
 DEFAULT_ID_FIELDS = ("mac", "cert_cn")
 ATTACH_CAUSE = "attach"
+OPEN_CAUSE = "open"
 PORT_BACK_CAUSE = "port_back"
 _STAMPED = frozenset({"seq", "ts", "t", "unit", "fw", "dev"})
 _MS_DIGITS = 3
@@ -187,6 +188,9 @@ class DeviceSession:
         self._lost_count = 0
         self._next_attempt = 0.0
         self._reconnect_failures: set[str] = set()  # messages already noted since the loss
+        # True until the attach pulse returns: the chip is held in reset meanwhile, so any
+        # `rst:` line stored by then is the bench adapter's reset-on-open.
+        self._opening = True
         self._closing = threading.Event()
         self._kick = threading.Event()  # wakes housekeeping on a gate change
         self._pause_req = threading.Event()
@@ -221,6 +225,8 @@ class DeviceSession:
             self._reader.start()
             self._housekeeper.start()
             transport.reset(False)
+            with self._cond:
+                self._opening = False
         except BaseException:
             self.close()
             raise
@@ -372,7 +378,11 @@ class DeviceSession:
         )
 
     def _classify(self, line: LogLine, match: ResetMatch, sha: str | None) -> ResetInfo:
-        arming, self._arming = self._arming, None
+        if self._opening:
+            # The open's reset must not spend the attach arm meant for the pulse's boot.
+            arming: _Arming | None = _Arming(OPEN_CAUSE, line.t)
+        else:
+            arming, self._arming = self._arming, None
         # One arming covers one reset: a second reboot inside the window is a real surprise.
         expected = arming is not None and line.t <= arming.until
         context = (
