@@ -16,7 +16,9 @@ import pytest
 from benchctl import capture, daemon, flash, paths
 from benchctl.client import Channel, Client
 from benchctl.errors import BenchctlError, BusyError, DeviceError, UsageError
-from benchctl.lease import PortLock
+from benchctl.lease import STALE_ENV, LeaseManager, PortLock
+from benchctl.profile import load_profile
+from benchctl.registry import load_registry
 from benchctl.types import LogLine
 from conftest import PROFILE_NAME, UNIT, install_profile
 from fake_daemon import (
@@ -514,6 +516,72 @@ def test_daemon_rejects_pattern_with_order(served: Served) -> None:
 
 
 # --- lifecycle ---------------------------------------------------------------------------
+
+
+def test_a_long_wait_keeps_its_owners_lease_fresh(
+    served: Served, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(STALE_ENV, "0.3")
+    with served.client("alice") as alice, served.client("bob") as bob:
+        alice.mark("held")
+        waiting = threading.Thread(
+            target=lambda: alice.wait("never", "attach", 1.0, absent=None, window=None, order=None)
+        )
+        waiting.start()
+        time.sleep(0.6)  # twice the stale bound: only the progress ticks keep alice's lease
+        try:
+            with pytest.raises(BusyError, match="held by alice"):
+                bob.mark(None)
+        finally:
+            waiting.join()
+
+
+def test_an_open_tail_keeps_its_owners_lease_fresh(
+    served: Served, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(STALE_ENV, "0.3")
+    monkeypatch.setattr(daemon, "TAIL_TICK_S", 0.05)
+    with served.client("alice") as alice, served.client("bob") as bob:
+        alice.mark("held")
+        feed = alice.tail("attach", events=False)
+        time.sleep(0.6)
+        try:
+            with pytest.raises(BusyError, match="held by alice"):
+                bob.mark(None)
+        finally:
+            feed.close()
+
+
+def make_daemon(config: Path) -> daemon.Daemon:
+    unit = load_registry(config).unit(UNIT)
+    session = FakeSession(unit, load_profile(PROFILE_NAME, config, config))
+    return daemon.Daemon(session, unit, LeaseManager(paths.lease_path(UNIT), session.emit))
+
+
+def test_the_detach_op_leaves_stopping_to_the_connection(config: Path) -> None:
+    served = make_daemon(config)
+    left, right = socket.socketpair()
+    conn = daemon._Conn(Channel(left), owner="alice")
+    assert served._op_detach(daemon._Args("detach", {}), conn, daemon._Request("1", print)) == {}
+    assert served.stop_reason == "detach"
+    assert not served.stop.is_set()
+    left.close()
+    right.close()
+
+
+def test_detach_is_answered_before_the_daemon_stops(config: Path) -> None:
+    served = make_daemon(config)
+    left, right = socket.socketpair()
+    client = Channel(right)
+    client.send({"id": "1", "op": "hello", "args": {"owner": "alice"}})
+    client.send({"id": "2", "op": "detach", "args": {}})
+    served._serve_conn(left)  # returns once detach is answered
+    hello, detach = client.recv(_START_S), client.recv(_START_S)
+    assert hello is not None
+    assert hello["ok"] is True
+    assert detach == {"id": "2", "ok": True, "result": {}}
+    assert served.stop.is_set()
+    client.close()
 
 
 def test_detach_cleans_up_and_records_why(served: Served) -> None:

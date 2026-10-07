@@ -29,6 +29,7 @@ from benchctl import __version__, paths
 from benchctl import capture as capture_mod
 from benchctl import flash as flash_mod
 from benchctl.client import PROTO, Channel, check_socket_path
+from benchctl.defaults import LOG_LIMIT, PROGRESS_S, RESET_WAIT_S, WAIT_TIMEOUT_S
 from benchctl.errors import (
     BenchctlError,
     BusyError,
@@ -42,16 +43,12 @@ from benchctl.profile import FLASH_AFTER, Profile, load_profile
 from benchctl.registry import Unit, load_registry
 from benchctl.types import Cursor, Event, Identity, LogLine, Offset, Session
 
-PROGRESS_S = 5.0
 LEASE_FLUSH_S = 5.0
 ACCEPT_TICK_S = 0.2
 TAIL_TICK_S = 0.2
-DEFAULT_WAIT_S = 60.0
-DEFAULT_LOG_LIMIT = 10_000
-DEFAULT_WAIT_RST_S = 5.0
 LISTEN_BACKLOG = 16
 
-# Section 3.4's mutating set, plus `capture`, which resets the unit.
+# Section 3.4's mutating set.
 MUTATING_OPS = frozenset(
     {"cmd", "reset", "flash", "mark", "arm_reset", "detach", "identity", "capture"}
 )
@@ -291,9 +288,13 @@ class Daemon:
                 if op == "tail":
                     self._tail(conn, req_id, frame.get("args"))
                     return
-                conn.channel.send(self._handle(conn, req_id, op, frame.get("args", {})))
-                if op == "detach" and self.stop.is_set():
-                    return
+                reply = self._handle(conn, req_id, op, frame.get("args", {}))
+                try:
+                    conn.channel.send(reply)
+                finally:
+                    # Stopping only after the reply is sent, so the client hears its detach.
+                    if op == "detach" and reply.get("ok") is True:
+                        self.stop.set()
         except OSError:
             return
         finally:
@@ -314,7 +315,7 @@ class Daemon:
             verify = op in MUTATING_OPS and op not in UNVERIFIED_OK
             # The probe waits for shell-ready, so the client needs ticks even on a quick op.
             probe = verify and self.session.status().identity is None
-            with self._progress(conn.channel, req_id, op, always=probe) as note:
+            with self._progress(conn.channel, req_id, op, owner, always=probe) as note:
                 if verify:
                     self._require_verified(note)
                 result = handler(args, conn, _Request(req_id, note))
@@ -327,10 +328,11 @@ class Daemon:
 
     @contextlib.contextmanager
     def _progress(
-        self, channel: Channel, req_id: str, op: str, *, always: bool = False
+        self, channel: Channel, req_id: str, op: str, owner: str, *, always: bool = False
     ) -> Iterator[Callable[[dict[str, Any]], None]]:
         """Send `{elapsed, offset, note}` every `progress_interval` until the op returns, so a
-        client tells a slow wait from a dead daemon. The yielded callback updates the note."""
+        client tells a slow wait from a dead daemon, and keep `owner`'s lease fresh: a long
+        wait is not idleness (Section 3.4). The yielded callback updates the note."""
         latest: dict[str, Any] = {"note": op}
 
         def update(progress: dict[str, Any]) -> None:
@@ -344,6 +346,7 @@ class Daemon:
 
         def tick() -> None:
             while not done.wait(self.progress_interval):
+                self.lease.touch(owner)
                 offset: Any
                 try:
                     offset = self.session.status().offset
@@ -380,10 +383,7 @@ class Daemon:
         if not isinstance(value, str):
             raise UsageError(f"{args.op}: {key}: expected an offset or a cursor")
         Cursor.parse(value)
-        try:
-            return self.session.resolve(value)
-        except LookupError:
-            raise UsageError(f"{args.op}: {key}: unknown mark {value!r}") from None
+        return self.session.resolve(value)
 
     def _identity_view(self, identity: Identity | None) -> Identity | None:
         if identity is not None and not identity.verified and self._override:
@@ -500,7 +500,7 @@ class Daemon:
         result = self.session.wait(
             pattern,
             since,
-            args.seconds("timeout", DEFAULT_WAIT_S),
+            args.seconds("timeout", WAIT_TIMEOUT_S),
             absent=absent,
             window=args.number("window", None),
             order=order,
@@ -525,7 +525,7 @@ class Daemon:
     def _op_log(self, args: _Args, conn: _Conn, req: _Request) -> dict[str, Any]:
         since = self._cursor(args, "since", "attach") or 0
         until = self._cursor(args, "until")
-        limit = args.integer("limit", DEFAULT_LOG_LIMIT)
+        limit = args.integer("limit", LOG_LIMIT)
         end = self.session.status().offset  # before the query, so `next` never skips a line
         lines = self.session.log(since, until, args.regex("grep"), limit)
         if lines and len(lines) >= limit:
@@ -538,9 +538,7 @@ class Daemon:
 
     def _op_reset(self, args: _Args, conn: _Conn, req: _Request) -> dict[str, Any]:
         offset = self.session.status().offset
-        info = self.session.reset(
-            args.flag("bootloader"), args.seconds("wait_rst", DEFAULT_WAIT_RST_S)
-        )
+        info = self.session.reset(args.flag("bootloader"), args.seconds("wait_rst", RESET_WAIT_S))
         return {"offset": offset, "reset": _jsonable(info)}
 
     def _op_arm_reset(self, args: _Args, conn: _Conn, req: _Request) -> dict[str, Any]:
@@ -603,7 +601,7 @@ class Daemon:
     def _op_gate(self, args: _Args, conn: _Conn, req: _Request) -> dict[str, Any]:
         since = self._cursor(args, "since", "boot") or 0
         env_gate = self.session.profile.env_gate
-        default = DEFAULT_WAIT_S if env_gate is None else env_gate.timeout
+        default = WAIT_TIMEOUT_S if env_gate is None else env_gate.timeout
         return self.session.gate_check(since, args.seconds("timeout", default))
 
     def _op_lease(self, args: _Args, conn: _Conn, req: _Request) -> dict[str, Any]:
@@ -617,8 +615,7 @@ class Daemon:
         raise UsageError(f"lease: action: take or release, got {action!r}")
 
     def _op_detach(self, args: _Args, conn: _Conn, req: _Request) -> dict[str, Any]:
-        self.stop_reason = "detach"
-        self.stop.set()
+        self.stop_reason = "detach"  # _serve_conn stops the daemon once the reply is out
         return {}
 
     # --- tail ------------------------------------------------------------------------
@@ -636,13 +633,17 @@ class Daemon:
             # Subscribed first, so a line stored during the backfill arrives on the feed.
             nxt = since
             while True:
-                batch = self.session.log(nxt, None, None, DEFAULT_LOG_LIMIT)
+                batch = self.session.log(nxt, None, None, LOG_LIMIT)
                 for line in batch:
                     conn.channel.send({"id": req_id, "line": dataclasses.asdict(line)})
                     nxt = line.offset + 1
-                if len(batch) < DEFAULT_LOG_LIMIT:
+                if len(batch) < LOG_LIMIT:
                     break
+            touched = time.monotonic()
             while not self.stop.is_set() and not _peer_closed(conn.channel.sock):
+                if conn.owner is not None and time.monotonic() - touched >= TAIL_TICK_S:
+                    self.lease.touch(conn.owner)  # watching is not idleness either
+                    touched = time.monotonic()
                 try:
                     item = feed.get(TAIL_TICK_S)
                 except BenchctlError as exc:
