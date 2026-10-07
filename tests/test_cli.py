@@ -8,16 +8,17 @@ import shutil
 import tempfile
 from collections.abc import Iterator, Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from click.testing import CliRunner, Result
 
-from benchctl import capture, cli, flash, paths, runner
-from benchctl.client import DAEMON_ARGV_ENV, daemon_pid
+from benchctl import capture, cli, flash, monitor, paths, runner
+from benchctl.client import DAEMON_ARGV_ENV, Client, daemon_pid
 from benchctl.lease import OWNER_ENV, PortLock
+from benchctl.profile import load_profile
 from benchctl.runner import RunResult
-from benchctl.types import FlashFile, FlashResult, LogLine
+from benchctl.types import CmdResult, DeviceClient, FlashFile, FlashResult, LogLine
 from conftest import PROFILE_NAME, UNIT, install_profile
 from fake_daemon import (
     APP_VERSION,
@@ -580,6 +581,48 @@ def test_run_passes_through_the_runner(bench: Path, monkeypatch: pytest.MonkeyPa
     blocked = run_json("run", str(SCENARIO), "--var", "result=precondition_failed", code=1)
     assert_error(blocked, "assert")
     assert blocked["result"] == "precondition_failed"
+
+
+def test_a_malformed_status_reply_is_a_protocol_error(
+    bench: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def no_gate(self: Client, op: str, args: Mapping[str, Any]) -> dict[str, Any]:
+        return {"unit": UNIT, "pid": 1, "offset": 0}
+
+    monkeypatch.setattr(Client, "connect", lambda self: {})
+    monkeypatch.setattr(Client, "request", no_gate)
+    result = invoke("status", "--json")
+    assert result.exit_code == 4
+    assert_error(json.loads(result.stdout), "protocol")
+    assert "Traceback" not in result.stdout + result.stderr
+
+
+def test_a_refused_cmd_names_the_refusal(bench: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(FAKE_DAEMON_ENV, json.dumps({"progress_s": 0.1, "shell_not_ready": True}))
+    data = run_json("cmd", "version", code=1)
+    assert_error(data, "timeout")
+    assert data["error"]["message"] == "cmd timeout: shell not ready (state=booting)"
+    run_json("detach")
+
+
+class _RefusingClient:
+    def __init__(self) -> None:
+        self.sent: list[str] = []
+
+    def cmd(self, line: str, **kwargs: Any) -> CmdResult:
+        self.sent.append(line)
+        return CmdResult(7, "timeout", "shell not ready (state=booting)", [], None, 0.0)
+
+
+def test_monitor_reports_a_refused_line(
+    bench: Path, config_dir: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    profile = load_profile(PROFILE_NAME, config_dir, config_dir)
+    fake = _RefusingClient()
+    assert monitor.handle_line(cast(DeviceClient, fake), profile, "version")
+    assert fake.sent == ["version"]
+    err = capsys.readouterr().err
+    assert err == "benchctl: cmd timeout: shell not ready (state=booting)\n"
 
 
 def test_monitor_sends_typed_lines_and_exits_on_ctrl_bracket(bench: Path) -> None:

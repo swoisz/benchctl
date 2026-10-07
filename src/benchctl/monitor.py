@@ -37,7 +37,7 @@ def handle_line(client: DeviceClient, profile: Profile, line: str) -> bool:
             client.reset(False)
         else:
             profile.check_allowed(line)
-            client.cmd(
+            result = client.cmd(
                 line,
                 expect=None,
                 error=[],
@@ -48,6 +48,9 @@ def handle_line(client: DeviceClient, profile: Profile, line: str) -> bool:
                 force=False,
                 source=SOURCE,
             )
+            if result.status != "ok":  # a refusal: the gate held the line back
+                reason = result.line if result.line is not None else line
+                click.echo(f"benchctl: cmd {result.status}: {reason}", err=True)
     except BenchctlError as exc:
         click.echo(f"benchctl: {exc.message}", err=True)
     return True

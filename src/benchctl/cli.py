@@ -26,6 +26,7 @@ from benchctl import flash as flash_mod
 from benchctl import monitor as monitor_mod
 from benchctl import runner as runner_mod
 from benchctl.client import ATTACH_TIMEOUT_S, Client, NotAttached, daemon_pid
+from benchctl.defaults import LOG_LIMIT, REDACTED, RESET_WAIT_S, WAIT_TIMEOUT_S
 from benchctl.durations import parse_duration
 from benchctl.errors import (
     AssertionFailed,
@@ -43,9 +44,6 @@ from benchctl.scenario import load_scenario, validate_paths
 from benchctl.types import Cursor, FlashResult, LogLine, ResetInfo, Status
 
 HEARTBEAT_S = 10.0
-DEFAULT_WAIT_S = 60.0
-DEFAULT_RESET_WAIT_S = 5.0
-DEFAULT_LOG_LIMIT = 10_000
 DEFAULT_CAPTURE_S = 10.0
 TAIL_TICK_S = 0.5
 _JSON_FLAG = "--json"
@@ -488,7 +486,7 @@ def lease(opts: Opts, take: bool, release: bool) -> int:
 @click.option("--since", default="attach", show_default=True, help="Cursor.")
 @click.option("--until", help="Cursor (exclusive).")
 @click.option("--grep", help="Regex the lines must contain.")
-@click.option("--limit", type=click.IntRange(min=1), default=DEFAULT_LOG_LIMIT, show_default=True)
+@click.option("--limit", type=click.IntRange(min=1), default=LOG_LIMIT, show_default=True)
 @click.option("--tail", "follow", is_flag=True, help="Follow new lines (text mode only).")
 def log(
     opts: Opts, since: str, until: str | None, grep: str | None, limit: int, follow: bool
@@ -664,7 +662,7 @@ def cmd(
         capture = True
     if timeout is None:
         timeout = (entry.timeout if entry else None) or profile.console.timeout
-    shown = "<redacted>" if secret else repr(line)
+    shown = REDACTED if secret else repr(line)
     client = opts.client(
         spawn=True, heartbeat=Heartbeat(opts, f"for the reply to {shown}", timeout)
     )
@@ -691,7 +689,11 @@ def cmd(
     if result.status == "error":
         failure = AssertionFailed(f"cmd error: {result.line}")
     elif result.status == "timeout":
-        failure = TimeoutError_(f"cmd timeout after {timeout:g} s: {shown}")
+        # A refusal (shell not ready, device busy) names itself in `line`; nothing was sent.
+        if result.line is not None:
+            failure = TimeoutError_(f"cmd timeout: {result.line}")
+        else:
+            failure = TimeoutError_(f"cmd timeout after {timeout:g} s: {shown}")
     text = result.captured if result.captured is not None else result.line
     return _finish(opts, fields, text, failure)
 
@@ -700,7 +702,7 @@ def cmd(
 @_verb()
 @click.argument("pattern", required=False)
 @click.option("--since", required=True, help="Cursor: attach, boot, an offset, or a mark.")
-@click.option("--timeout", type=DURATION, default=DEFAULT_WAIT_S, show_default=True)
+@click.option("--timeout", type=DURATION, default=WAIT_TIMEOUT_S, show_default=True)
 @click.option("--absent", help="Regex that must not appear (before PATTERN, or in --window).")
 @click.option("--window", type=DURATION, help="Absence window (default: --timeout).")
 @click.option("--order", help="Comma-separated regexes that must match in this order.")
@@ -744,7 +746,7 @@ def wait(
 @main.command()
 @_verb()
 @click.option("--bootloader", is_flag=True, help="Reset into the ROM download mode.")
-@click.option("--timeout", type=DURATION, default=DEFAULT_RESET_WAIT_S, show_default=True)
+@click.option("--timeout", type=DURATION, default=RESET_WAIT_S, show_default=True)
 def reset(opts: Opts, bootloader: bool, timeout: float) -> int:
     """Reset the unit and report the rst: line."""
     offset, info = opts.client(spawn=True).reset(bootloader, timeout)
