@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
+from benchctl.defaults import RESET_WAIT_S
 from benchctl.errors import BenchctlError, UsageError
 
 if TYPE_CHECKING:
@@ -231,8 +232,6 @@ class Transport(Protocol):
         more."""
         ...
 
-    def set_baud(self, baud: int) -> None: ...
-
     def close(self) -> None: ...
 
     @property
@@ -289,7 +288,7 @@ class Session(Protocol):
     ) -> list[LogLine]: ...
 
     def reset(
-        self, bootloader: bool, wait_rst: float = 5.0, *, cause: str = "reset"
+        self, bootloader: bool, wait_rst: float = RESET_WAIT_S, *, cause: str = "reset"
     ) -> ResetInfo | None:
         """`cause` is the arming record's cause (Section 4.5); flash passes "flash"."""
         ...
@@ -367,7 +366,9 @@ class DeviceClient(Protocol):
         """(lines, next offset)."""
         ...
 
-    def reset(self, bootloader: bool, wait_rst: float = 5.0) -> tuple[Offset, ResetInfo | None]:
+    def reset(
+        self, bootloader: bool, wait_rst: float = RESET_WAIT_S
+    ) -> tuple[Offset, ResetInfo | None]:
         """(offset of the reset request, the reset seen within wait_rst or None)."""
         ...
 
