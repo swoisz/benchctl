@@ -22,8 +22,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 from benchctl import paths
+from benchctl.defaults import RESET_WAIT_S
 from benchctl.errors import BenchctlError, DeviceError, UsageError, from_dict
-from benchctl.lease import default_owner, pid_alive
+from benchctl.lease import default_owner, lock_held, pid_alive
 from benchctl.types import (
     AppDesc,
     CmdResult,
@@ -176,15 +177,27 @@ def _build[D: DataclassInstance](cls: type[D], data: Any, **nested: Any) -> D:
         raise BenchctlError(f"bad {cls.__name__} from daemon: {exc}", code="protocol") from exc
 
 
+def _field[T](data: Any, key: str, kind: type[T]) -> T:
+    """`data[key]` from a daemon reply; a missing or mistyped one is a protocol error."""
+    value = data.get(key) if isinstance(data, Mapping) else None
+    if not isinstance(value, kind):
+        raise BenchctlError(f"daemon reply lacks {key!r} ({kind.__name__})", code="protocol")
+    return value
+
+
 def decode_reset(data: Any) -> ResetInfo | None:
-    return None if data is None else _build(ResetInfo, data, context=list(data["context"]))
+    if data is None:
+        return None
+    return _build(ResetInfo, data, context=list(_field(data, "context", list)))
 
 
 def decode_identity(data: Any) -> Identity | None:
     if data is None:
         return None
-    mismatches = {name: (pair[0], pair[1]) for name, pair in data["mismatches"].items()}
-    return _build(Identity, data, fields=dict(data["fields"]), mismatches=mismatches)
+    mismatches = {
+        name: (pair[0], pair[1]) for name, pair in _field(data, "mismatches", dict).items()
+    }
+    return _build(Identity, data, fields=dict(_field(data, "fields", dict)), mismatches=mismatches)
 
 
 def decode_status(data: Any) -> Status:
@@ -194,7 +207,7 @@ def decode_status(data: Any) -> Status:
         lease=dict(data.get("lease") or {}),
         identity=decode_identity(data.get("identity")),
         last_reset=decode_reset(data.get("last_reset")),
-        gate=_build(GateState, data["gate"]),
+        gate=_build(GateState, _field(data, "gate", dict)),
     )
 
 
@@ -207,7 +220,7 @@ def decode_flash(data: Any) -> FlashResult:
     return _build(
         FlashResult,
         data,
-        files=[_build(FlashFile, item) for item in data["files"]],
+        files=[_build(FlashFile, item) for item in _field(data, "files", list)],
         app=None if app is None else _build(AppDesc, app),
         reset=decode_reset(data.get("reset")),
     )
@@ -314,13 +327,19 @@ class Client:
                 return sock
             if proc is None:
                 # Re-checked every poll: a daemon another client spawned may die starting up.
-                if daemon_pid(self.unit) is None:
-                    if path.exists():
-                        path.unlink(missing_ok=True)  # its daemon is dead: a stale socket
+                # A live pid whose lease.lock is free is not a daemon (a pid reused after a
+                # reboot left a stale pidfile).
+                pid = daemon_pid(self.unit)
+                if pid is None or not lock_held(paths.lease_lock_path(self.unit)):
+                    path.unlink(missing_ok=True)  # its daemon is dead: a stale socket
                     log_start = _log_size(paths.daemon_log_path(self.unit))
                     proc = self._spawn()
-            elif proc.poll() is not None and proc.returncode != LOST_RACE_EXIT:
-                raise _startup_failure(self.unit, proc.returncode, log_start)
+            elif proc.poll() is not None:
+                if proc.returncode != LOST_RACE_EXIT:
+                    raise _startup_failure(self.unit, proc.returncode, log_start)
+                # Lost the lock race. The winner may still die starting up, so forget this
+                # spawn and go back to the pidfile: wait for the winner, or spawn again.
+                proc = None
             if time.monotonic() >= deadline:
                 raise DeviceError(
                     f"daemon for {self.unit} did not come up within {self.attach_timeout:g} s; "
@@ -458,7 +477,9 @@ class Client:
         result = self.request("log", {"since": since, "until": until, "grep": grep, "limit": limit})
         return [decode_line(line) for line in result["lines"]], int(result["next"])
 
-    def reset(self, bootloader: bool, wait_rst: float = 5.0) -> tuple[Offset, ResetInfo | None]:
+    def reset(
+        self, bootloader: bool, wait_rst: float = RESET_WAIT_S
+    ) -> tuple[Offset, ResetInfo | None]:
         result = self.request("reset", {"bootloader": bootloader, "wait_rst": wait_rst})
         return int(result["offset"]), decode_reset(result.get("reset"))
 

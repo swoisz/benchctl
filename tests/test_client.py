@@ -124,6 +124,32 @@ def test_a_race_losers_busy_line_is_not_the_error(spawnable: Path) -> None:
     assert client_mod._startup_failure(UNIT, 4, 0).code == "device"
 
 
+def test_a_pidfile_naming_an_unrelated_live_process_is_stale(spawnable: Path) -> None:
+    # After a reboot the pidfile's pid can belong to anything; lease.lock is free then.
+    unrelated = subprocess.Popen(["sleep", "30"])
+    try:
+        paths.unit_dir(UNIT).mkdir(parents=True)
+        paths.pid_path(UNIT).write_text(f"{unrelated.pid}\n")
+        with Client(UNIT, spawn=True) as client:
+            assert client.status().pid not in (unrelated.pid, os.getpid())
+            client.detach()
+    finally:
+        unrelated.kill()
+        unrelated.wait()
+
+
+def test_a_lost_race_is_forgotten_and_spawned_again(
+    spawnable: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    marker = tmp_path / "lost-once"
+    config = {"progress_s": 0.1, "lose_race_once": str(marker)}
+    monkeypatch.setenv(FAKE_DAEMON_ENV, json.dumps(config))
+    with Client(UNIT, spawn=True) as client:
+        assert client.connect()["unit"] == UNIT  # no daemon ever won: we spawned twice
+        assert marker.exists()
+        client.detach()
+
+
 def test_a_stale_socket_is_replaced(spawnable: Path) -> None:
     sock_path = paths.socket_path(UNIT)
     sock_path.parent.mkdir(parents=True)
