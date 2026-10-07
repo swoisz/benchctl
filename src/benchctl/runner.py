@@ -19,10 +19,11 @@ from pathlib import Path
 from types import FrameType
 from typing import Any, Literal, TextIO
 
-from benchctl import artifacts
+from benchctl import artifacts, defaults
 from benchctl.durations import format_duration
 from benchctl.errors import BenchctlError, UsageError
 from benchctl.events import EventWriter, external_record, human_record, run_record, step_record
+from benchctl.logstore import format_line
 from benchctl.profile import Command, Profile, placeholders, render
 from benchctl.redact import Redactor
 from benchctl.report import ReportRow, at_offset, code, render_results
@@ -35,7 +36,7 @@ DEFAULT_TIMEOUTS: dict[str, float] = {
     "human": 600.0,
     "external": 60.0,
     "wait": 60.0,
-    "reset": 5.0,
+    "reset": defaults.RESET_WAIT_S,
     "flash": 300.0,
     "mark": 0.0,
 }
@@ -45,7 +46,6 @@ SERIAL_LOG = "serial.log"
 EVENTS_FILE = "events.jsonl"
 RESULTS_FILE = "results.md"
 SUMMARY_FILE = "summary.json"
-LOG_PAGE = 10_000  # the `log` op's default limit
 _TX_PREFIX = "## tx "  # the meta line a sent command leaves (Section 4.7)
 _PASSING_WAITS = ("match", "absent_ok", "order_ok")
 _FEED_POLL_S = 0.1
@@ -480,11 +480,6 @@ def _gate_text(verdict: dict[str, Any]) -> str:
     return "; ".join(parts) or "not ok"
 
 
-def _log_text(line: LogLine) -> str:
-    """A `serial.log` line (Section 4.7): `HH:MM:SS.mmm +SSSSS.mmm <text>`."""
-    return f"{line.ts} +{line.t:09.3f} {line.text}"
-
-
 class _Run:
     """One execution: the step loop and everything it writes to the run dir."""
 
@@ -537,9 +532,6 @@ class _Run:
     # --- lifecycle ---------------------------------------------------------------------
 
     def run(self) -> RunResult:
-        self.run_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(self.scenario.path, self.run_dir / SCENARIO_COPY)
-        shutil.copyfile(self.profile.path, self.run_dir / PROFILE_COPY)
         started = datetime.now()
         status = self.client.status()
         self.unit = status.unit
@@ -547,6 +539,10 @@ class _Run:
         # here, before the first record, rather than lazily inside the first `mark`.
         self._learn(self.client.identity())
         self.first = self.prev_start = self.client.mark(None)
+        # Only now: a unit that fails those three calls leaves no half-written run dir.
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(self.scenario.path, self.run_dir / SCENARIO_COPY)
+        shutil.copyfile(self.profile.path, self.run_dir / PROFILE_COPY)
         self.clock = _DeviceClock(_attach_epoch(status.attached_at))
         writer = EventWriter(
             self.run_dir / EVENTS_FILE,
@@ -657,7 +653,7 @@ class _Run:
             while end is None or since < end:
                 try:
                     lines, after = self.client.log(
-                        since=since, until=None, grep=None, limit=LOG_PAGE
+                        since=since, until=None, grep=None, limit=defaults.LOG_LIMIT
                     )
                 except BenchctlError as exc:
                     self.notes.append(f"serial.log is incomplete: {exc.message}")
@@ -667,7 +663,7 @@ class _Run:
                     return False
                 for line in lines:
                     if end is None or line.offset < end:
-                        out.write(_log_text(line) + "\n")
+                        out.write(format_line(line) + "\n")
                 if not lines or after <= since:
                     break
                 since = after
@@ -827,8 +823,9 @@ class _Run:
             error=error,
             capture=capture,
             timeout=ctx.timeout,
-            reboots=command is not None and command.reboots,
-            secret=False,
+            # The session's own `cmd:` arm would replace the step's `step:N` arm.
+            reboots=command is not None and command.reboots and not step.expect_reset,
+            secret=step.secret,
             force=False,
             source="runner",
         )

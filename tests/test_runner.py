@@ -18,11 +18,13 @@ from typing import Any, Literal
 import pytest
 
 from benchctl import errors
+from benchctl.defaults import REDACTED
 from benchctl.profile import Command, Profile
 from benchctl.runner import (
     RunResult,
     compute_budget,
     run_scenario,
+    step_span,
     step_timeout,
 )
 from benchctl.scenario import Scenario, load_scenario
@@ -251,6 +253,7 @@ class FakeClient:
             timeout=timeout,
             reboots=reboots,
             source=source,
+            secret=secret,
         )
         if self.on_cmd is not None:
             override = self.on_cmd(line)
@@ -258,8 +261,9 @@ class FakeClient:
                 return override
         if reboots:
             self.armed = f"cmd:{line}"
-        tx = self.line(f"## tx {line}", meta=True)
-        self.event("tx", tx.offset, line=line, source=source, request_id="r1")
+        shown = REDACTED if secret else line
+        tx = self.line(f"## tx {shown}", meta=True)
+        self.event("tx", tx.offset, line=shown, source=source, request_id="r1")
         stored = [self.line(text) for text in self.replies.get(line, ["command not found"])]
         if line in self.reboot_lines:
             self.device_reset()
@@ -1340,6 +1344,45 @@ def test_a_cmd_the_shell_was_not_ready_for_has_no_tx_evidence(
     result, _ = run(fake, scenario(tmp_path, body), profile, tmp_path)
     assert result.result == "fail"
     assert result.steps[0]["detail"] == "timeout: `shell not ready (state=booting)`"
+
+
+def test_a_secret_cmd_never_writes_its_line(tmp_path: Path, profile: Profile) -> None:
+    fake = FakeClient()
+    secret = "hunter2-wifi-pass"
+    body = '[[step]]\nkind = "cmd"\nsend = "wifi set lab {pass}"\nsecret = true\n'
+    result, _ = run(fake, scenario(tmp_path, body), profile, tmp_path, variables={"pass": secret})
+    assert result.result == "pass", result.steps
+    sent = fake.ops("cmd")[0]
+    assert (sent["line"], sent["secret"]) == (f"wifi set lab {secret}", True)
+    tx = fake.find(f"## tx {REDACTED}")
+    tx_events = [e for e in events_of(result) if e["type"] == "tx"]
+    assert [e["line"] for e in tx_events] == [REDACTED]
+    assert result.steps[0]["detail"] == f"`{tx.text}` @ {tx.offset}"
+    for name in ("events.jsonl", "results.md", "summary.json", "serial.log"):
+        assert secret not in (result.run_dir / name).read_text(encoding="utf-8"), name
+
+
+def test_expect_reset_keeps_its_arm_over_a_rebooting_map_command(
+    tmp_path: Path, profile: Profile
+) -> None:
+    assert profile.commands["restart"].reboots
+    fake = FakeClient()
+    body = '[[step]]\nkind = "cmd"\ncommand = "restart"\nexpect_reset = true\n'
+    loaded = scenario(tmp_path, body)
+    run(fake, loaded, profile, tmp_path)
+    window = step_span(loaded.steps[0], profile) + profile.boot.expected_reset_window
+    assert fake.ops("arm_reset") == [{"cause": "step:1", "window": window}]
+    assert fake.ops("cmd")[0]["reboots"] is False
+
+
+def test_a_failed_identity_probe_leaves_no_run_dir(tmp_path: Path, profile: Profile) -> None:
+    fake = FakeClient()
+    fake.raise_in["identity"] = errors.DeviceError("identity mismatch: mac expected X got Y")
+    body = '[[step]]\nkind = "mark"\nname = "m"\n'
+    with pytest.raises(errors.DeviceError, match="identity mismatch"):
+        run(fake, scenario(tmp_path, body), profile, tmp_path)
+    assert not (tmp_path / "run").exists()
+    assert [op for op, *_ in fake.calls] == ["status", "identity"]
 
 
 def test_cmd_error_fails_the_step_with_its_line(tmp_path: Path, profile: Profile) -> None:

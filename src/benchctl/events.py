@@ -9,17 +9,12 @@ from __future__ import annotations
 import json
 import threading
 from collections.abc import Callable
-from datetime import datetime
 from pathlib import Path
 
+from benchctl.defaults import iso_now
 from benchctl.types import Event, Offset
 
 _T_DECIMALS = 3
-
-
-def host_timestamp() -> str:
-    """Host time as events carry it: ISO 8601 with the UTC offset, millisecond precision."""
-    return datetime.now().astimezone().isoformat(timespec="milliseconds")
 
 
 def run_record(
@@ -115,7 +110,7 @@ class EventWriter:
             self._seq += 1
             stamped: Event = {
                 "seq": self._seq,
-                "ts": host_timestamp(),
+                "ts": iso_now(),
                 "t": round(self._now_t(), _T_DECIMALS),
                 "unit": self._unit,
                 "fw": self._fw,
