@@ -972,13 +972,13 @@ chip = "esp32s3"              # esptool chip name; required for flash (loaded as
 [console]
 baud = 115200                 # default 115200
 line_ending = "\r"            # TX line ending; default "\r\n"
-prompt = "demo> "          # optional; enables capture-until-prompt and prompt gating
+prompt = "demo> "             # optional; enables capture-until-prompt and prompt gating
 timeout = 8.0                 # cmd reply timeout, seconds; default 5.0 (hail's)
 tx_chunk = 64                 # bytes per write
 tx_chunk_delay_ms = 10
 
 [boot]
-ready = "demo> "           # regex; default = re.escape(console.prompt); matched on lines and tail
+ready = "demo> "              # regex; default = re.escape(console.prompt); matched on lines and tail
 settle = 2.5                  # seconds after ready before the first cmd
 ready_timeout = 20.0          # booting longer than this → probe
 probe = ""                    # line sent to provoke a prompt (empty = bare line ending)
@@ -1044,7 +1044,7 @@ profiles/<name>/profile.toml` (the file's `name` need not equal the directory's)
 
 ```toml
 [units.u1]
-profile = "demo"                                  # default profile for this unit
+profile = "demo"                                     # default profile for this unit
 
 [units.u1.console]                                   # v1: one console port per unit
 match = { vid = "0403", pid = "6010", location = "2-1", device = "*usbserial-*1" }
@@ -1162,7 +1162,7 @@ incomplete `serial.log`) sit between the table and the `Resets:` line, one bulle
 
 ```toml
 name = "restart held during a call"       # required
-profile = "demo"                        # optional; overrides the unit's default
+profile = "demo"                           # optional; overrides the unit's default
 budget = "25m"                             # optional declared worst case
 
 [preconditions]
