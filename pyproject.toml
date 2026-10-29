@@ -3,6 +3,7 @@ name = "benchctl"
 dynamic = ["version"]
 description = "Bench harness for ESP-IDF units: one daemon per serial port, stateless CLI clients"
 readme = "README.md"
+license = "MIT"
 requires-python = ">=3.12"
 dependencies = [
     "pyserial>=3.5",
