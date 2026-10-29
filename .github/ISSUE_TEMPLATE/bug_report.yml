@@ -1,0 +1,44 @@
+name: Bug report
+description: benchctl did something wrong
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: >
+        Remove credentials, hostnames and anything else private from logs before pasting.
+        Security issues go through the Security tab, not here.
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `benchctl --version`
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, Python version, chip and USB adapter (e.g. macOS 15, Python 3.13, ESP32-S3 via FTDI)
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: What you ran
+      description: The commands, and the profile or scenario excerpt they used.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: What happened
+      description: The `--json` output, plus the relevant `events.jsonl` or `daemon.log` lines.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
